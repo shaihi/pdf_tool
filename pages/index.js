@@ -6,9 +6,18 @@ export default function Home() {
   const [loadingAll, setLoadingAll] = useState(false);
   const [rowLoading, setRowLoading] = useState(-1);
   const [errorMsg, setErrorMsg] = useState("");
+  const [rowHints, setRowHints] = useState({}); // url-index -> hint string
 
   const addUrlField = () => setUrls([...urls, ""]);
-  const removeUrlField = (i) => setUrls(urls.filter((_, idx) => idx !== i));
+  const removeUrlField = (i) => {
+    const next = urls.filter((_, idx) => idx !== i);
+    setUrls(next);
+    setRowHints((h) => {
+      const copy = { ...h };
+      delete copy[i];
+      return copy;
+    });
+  };
   const updateUrl = (i, v) => {
     const next = [...urls];
     next[i] = v;
@@ -34,8 +43,12 @@ export default function Home() {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.message || "Export failed");
+      let err;
+      try { err = await res.json(); } catch { err = {}; }
+      const e = new Error(err.message || "Export failed");
+      e.code = err.code;
+      e.details = err.details;
+      throw e;
     }
     return res;
   };
@@ -58,6 +71,7 @@ export default function Home() {
   const handleDownloadRow = async (i) => {
     setErrorMsg("");
     setRowLoading(i);
+    setRowHints((h) => ({ ...h, [i]: "" }));
     try {
       const u = urls[i]?.trim();
       if (!u) throw new Error("URL is empty.");
@@ -65,7 +79,16 @@ export default function Home() {
       const host = safeHost(u);
       await saveBlob(res, `${host}_${Date.now()}.pdf`);
     } catch (e) {
-      setErrorMsg(e.message);
+      if (e.code === "PRIVATE_SHARE") {
+        setRowHints((h) => ({
+          ...h,
+          [i]: "This link appears private. Open it in an incognito window; if it asks you to sign in, change the share settings to Public and try again."
+        }));
+      } else if (e.code === "NO_ALLOWED_URLS" || e.code === "DOMAIN_BLOCKED") {
+        setRowHints((h) => ({ ...h, [i]: "Domain not supported for export." }));
+      } else {
+        setRowHints((h) => ({ ...h, [i]: e.message || "Failed to export this link." }));
+      }
     } finally {
       setRowLoading(-1);
     }
@@ -75,49 +98,56 @@ export default function Home() {
     <div style={{ maxWidth: 720, margin: "40px auto", fontFamily: "Inter, system-ui, sans-serif" }}>
       <h1 style={{ marginBottom: 8 }}>Multi-Chat Export</h1>
       <p style={{ marginTop: 0, color: "#555" }}>
-        Add one or more chat share links. Download each as **PDF** or all as a **ZIP**.
+        Add chat share links. Download each as <b>PDF</b> or all as a <b>ZIP</b>.
       </p>
 
       {urls.map((u, i) => (
-        <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, marginBottom: 10 }}>
-          <input
-            type="text"
-            value={u}
-            onChange={(e) => updateUrl(i, e.target.value)}
-            placeholder={`Chat link #${i + 1}`}
-            style={{ padding: "10px", border: "1px solid #ddd", borderRadius: 8 }}
-          />
-          <button
-            onClick={() => handleDownloadRow(i)}
-            disabled={!u.trim() || rowLoading === i}
-            style={{
-              padding: "10px 12px",
-              background: "#0B5FFF",
-              color: "white",
-              border: 0,
-              borderRadius: 8,
-              cursor: (!u.trim() || rowLoading === i) ? "not-allowed" : "pointer",
-              minWidth: 140
-            }}
-            title="Download this chat as PDF"
-          >
-            {rowLoading === i ? "Downloading…" : "Download PDF"}
-          </button>
-          <button
-            onClick={() => removeUrlField(i)}
-            disabled={urls.length === 1}
-            style={{
-              padding: "10px 12px",
-              background: "#eee",
-              color: "#111",
-              border: 0,
-              borderRadius: 8,
-              cursor: urls.length === 1 ? "not-allowed" : "pointer"
-            }}
-            title="Remove URL"
-          >
-            –
-          </button>
+        <div key={i} style={{ marginBottom: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8 }}>
+            <input
+              type="text"
+              value={u}
+              onChange={(e) => updateUrl(i, e.target.value)}
+              placeholder={`Chat link #${i + 1}`}
+              style={{ padding: "10px", border: "1px solid #ddd", borderRadius: 8 }}
+            />
+            <button
+              onClick={() => handleDownloadRow(i)}
+              disabled={!u.trim() || rowLoading === i}
+              style={{
+                padding: "10px 12px",
+                background: "#0B5FFF",
+                color: "white",
+                border: 0,
+                borderRadius: 8,
+                cursor: (!u.trim() || rowLoading === i) ? "not-allowed" : "pointer",
+                minWidth: 140
+              }}
+              title="Download this chat as PDF"
+            >
+              {rowLoading === i ? "Downloading…" : "Download PDF"}
+            </button>
+            <button
+              onClick={() => removeUrlField(i)}
+              disabled={urls.length === 1}
+              style={{
+                padding: "10px 12px",
+                background: "#eee",
+                color: "#111",
+                border: 0,
+                borderRadius: 8,
+                cursor: urls.length === 1 ? "not-allowed" : "pointer"
+              }}
+              title="Remove URL"
+            >
+              –
+            </button>
+          </div>
+          {!!rowHints[i] && (
+            <div style={{ marginTop: 6, fontSize: 13, color: "#b00020" }}>
+              {rowHints[i]}
+            </div>
+          )}
         </div>
       ))}
 
@@ -162,7 +192,6 @@ export default function Home() {
 function sanitize(s) {
   return String(s).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 100) || "chat";
 }
-
 function safeHost(u) {
   try { return new URL(u).hostname.replace(/\./g, "_"); } catch { return "chat"; }
 }

@@ -8,7 +8,7 @@ import fs from "fs";
 import path from "path";
 
 // ---- Config / Security ----
-const BLOCKED_DOMAINS = []; // explicitly not allowed
+const BLOCKED_DOMAINS = []; // none blocked now
 const ALLOWED_DOMAINS = [
   "chat.openai.com",
   "chatgpt.com",
@@ -24,8 +24,34 @@ const MAX_TEXT_LENGTH = 120_000;
 function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
 }
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// NEW: preflight public-access checker (detects login redirects / 4xx/5xx)
+async function checkPublicAccess(u) {
+  try {
+    const r = await fetch(u, { method: "GET", redirect: "manual" });
+    const status = r.status;
+    const loc = r.headers.get("location") || "";
+    const urlLower = (loc || "").toLowerCase();
+    const isLoginRedirect =
+      status >= 300 && status < 400 &&
+      (urlLower.includes("login") || urlLower.includes("signin") || urlLower.includes("auth"));
+    const isBlocked = status >= 400;
+    if (isLoginRedirect || isBlocked) {
+      return {
+        ok: false,
+        status,
+        location: loc,
+        reason: "PRIVATE_OR_BLOCKED",
+        message:
+          "This share link isn’t public (redirects to login or returns an error). Open it in an incognito window; if it prompts to sign in, make the share public.",
+      };
+    }
+    return { ok: true, status };
+  } catch (e) {
+    return { ok: false, status: 0, reason: "NETWORK", message: e?.message || "Network error" };
+  }
+}
 
 // ---- Handler ----
 export default async function handler(req, res) {
@@ -34,7 +60,6 @@ export default async function handler(req, res) {
     return error(res, 405, "METHOD_NOT_ALLOWED", "Use POST /api/export");
   }
 
-  // Accept { urls: [] }, or legacy { url: "a\nb" }
   let { title = "Chat Export", urls = [], url = "", content = "" } = req.body || {};
   if (!Array.isArray(urls)) urls = typeof urls === "string" ? urls.split(/\s+/).filter(Boolean) : [];
   if (urls.length === 0 && typeof url === "string" && url.trim()) {
@@ -60,34 +85,40 @@ export default async function handler(req, res) {
     return error(res, 400, "INVALID_INPUT", "Provide at least one chat URL or some chat text.");
   }
 
-  // Validate URLs & domains early
+  // Validate URLs & domains
   const cleaned = [];
   for (const raw of urls) {
     if (typeof raw !== "string" || !raw.trim() || raw.length > MAX_URL_LENGTH) continue;
     let u;
-    try {
-      u = new URL(raw);
-    } catch {
-      continue;
-    }
+    try { u = new URL(raw); } catch { continue; }
     const host = u.hostname.toLowerCase();
 
-    // Blocked domains (Claude)
     if (BLOCKED_DOMAINS.some((d) => host.endsWith(d))) {
       return error(res, 400, "DOMAIN_BLOCKED", "This domain is not supported.", { url: raw, domain: host });
     }
-
     if (!ALLOWED_DOMAINS.some((d) => host.endsWith(d))) continue;
     cleaned.push(u);
   }
-
   if (cleaned.length === 0) {
     return error(res, 400, "NO_ALLOWED_URLS", "No URLs with allowed domains were provided.");
   }
 
-  // Single URL → return a single PDF (used by “Download PDF” per row)
+  // Single URL → return a single PDF (per-row Download PDF)
   if (cleaned.length === 1) {
     const u = cleaned[0];
+
+    // NEW: preflight public access (helps with Claude private shares)
+    const pre = await checkPublicAccess(u.toString());
+    if (!pre.ok) {
+      return error(
+        res,
+        422,
+        "PRIVATE_SHARE",
+        pre.message,
+        { url: u.toString(), status: pre.status, location: pre.location }
+      );
+    }
+
     const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
     if (!BROWSERLESS_WS_URL) {
       return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
@@ -141,6 +172,12 @@ export default async function handler(req, res) {
 
   for (const u of cleaned) {
     try {
+      const pre = await checkPublicAccess(u.toString());
+      if (!pre.ok) {
+        console.warn("Skipping private/blocked:", u.toString(), pre.status, pre.location);
+        continue;
+      }
+
       const text = await scrapeChat(u.toString(), browser);
       if (!text || text.length < 60 || text.length > MAX_TEXT_LENGTH) continue;
 
@@ -149,7 +186,6 @@ export default async function handler(req, res) {
       const unique = `${Date.now()}_${index++}`;
       zip.file(`${base}_${unique}.pdf`, pdfBytes);
     } catch (e) {
-      // skip this URL but continue others
       console.error("Export error:", u.toString(), e?.message || e);
     }
   }
@@ -187,19 +223,15 @@ async function scrapeChat(url, browser) {
 
   const hostname = new URL(url).hostname;
 
+  // Prefer granular extraction for Gemini: each listitem is a turn
   let extracted;
   if (hostname.includes("gemini.google.com")) {
-    // Try to read individual turns. If none, fall back to main text.
     extracted = await page.evaluate(() => {
-      const turns = Array.from(document.querySelectorAll('c-wiz[role="list"] [role="listitem"], [role="listitem"]'))
-        .map(el => el.innerText?.trim())
-        .filter(Boolean);
-
-      if (turns.length > 0) {
-        return turns.join("\n\n---TURN---\n\n");
-      }
-      const main = document.querySelector("main");
-      return main?.innerText?.trim() || "";
+      const items = Array.from(document.querySelectorAll('c-wiz[role="list"] [role="listitem"], [role="listitem"]'));
+      const blocks = items.map(el => el.innerText?.trim()).filter(Boolean);
+      if (blocks.length > 0) return blocks.join("\n\n---TURN---\n\n");
+      const m = document.querySelector("main");
+      return m?.innerText?.trim() || "";
     });
   }
 
@@ -229,7 +261,7 @@ async function scrapeChat(url, browser) {
 
   await page.close();
 
-  // NEW: remove Gemini’s page header noise so the first "turn" becomes the user Q
+  // Remove Gemini header noise so first "turn" is the user question
   if (hostname.includes("gemini.google.com")) {
     extracted = stripGeminiHeader(extracted);
   }
@@ -237,34 +269,8 @@ async function scrapeChat(url, browser) {
   return extracted.replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function stripGeminiHeader(s) {
-  // Drop the top "Gemini … Created with 2.5 … Published … Google Search …" block and the share URL line.
-  const lines = s.split(/\n+/);
-  const cleaned = [];
-  let inHeader = true;
-  for (const line of lines) {
-    const L = line.trim();
-    if (!inHeader) { cleaned.push(L); continue; }
-    // While we are still in the header, keep skipping until we hit real content.
-    if (
-      /^gemini\b/i.test(L) ||
-      /^https:\/\/g\.co\/gemini\/share\//i.test(L) ||
-      /^(created with|published)/i.test(L) ||
-      /google search/i.test(L) ||
-      /^flash\s/i.test(L)
-    ) {
-      continue;
-    }
-    // first non-header line -> switch off header skipping
-    inHeader = false;
-    if (L) cleaned.push(L);
-  }
-  return cleaned.join("\n");
-}
-
 function getSelectorsForDomain(hostname) {
   if (hostname.includes("gemini.google.com")) {
-    // prefer list items; fall back to main
     return ['c-wiz[role="list"] [role="listitem"]', '[role="listitem"]', 'main'];
   }
   if (hostname.includes("chatgpt") || hostname.includes("openai")) {
@@ -282,20 +288,42 @@ function getSelectorsForDomain(hostname) {
   return ["body"];
 }
 
+// Strip Gemini page header block
+function stripGeminiHeader(s) {
+  const lines = s.split(/\n+/);
+  const cleaned = [];
+  let inHeader = true;
+  for (const line of lines) {
+    const L = line.trim();
+    if (!inHeader) { cleaned.push(L); continue; }
+    if (
+      /^gemini\b/i.test(L) ||
+      /^https:\/\/g\.co\/gemini\/share\//i.test(L) ||
+      /^(created with|published)/i.test(L) ||
+      /google search/i.test(L) ||
+      /^flash\s/i.test(L)
+    ) {
+      continue;
+    }
+    inHeader = false;
+    if (L) cleaned.push(L);
+  }
+  return cleaned.join("\n");
+}
+
 // Force proper bidi for mixed Hebrew/Latin/nums using isolates
 function shapeBidi(line) {
   const hasRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
   if (!hasRTL) return line;
-  // Wrap Latin/number runs with LRI/PDI, overall keep logical order
   return line
-    .replace(/([A-Za-z0-9@.#:_/+-]+)/g, '\u2066$1\u2069') // LRI … PDI
-    .replace(/\u2066\u2069/g, ""); // clean empty
+    .replace(/([A-Za-z0-9@.#:_/+-]+)/g, '\u2066$1\u2069') // LRI … PDI around Latin/nums
+    .replace(/\u2066\u2069/g, ""); // clean empties
 }
 
+// Role parsing (ChatGPT markers + Gemini fallbacks)
 function parseMessages(raw, sourceHost = "") {
   const isGemini = /gemini\.google\.com$/.test(sourceHost);
 
-  // If explicit turn separators were inserted, alternate starting with user.
   if (isGemini && raw.includes('---TURN---')) {
     const parts = raw.split(/\n?\s*---TURN---\s?\n?/).map(s => s.trim()).filter(Boolean);
     let role = "user";
@@ -331,12 +359,12 @@ function parseMessages(raw, sourceHost = "") {
   if (buf.length) paragraphs.push(buf.join(" ").trim());
 
   const messages = [];
-  let currentRole = isGemini ? "user" : "assistant";
+  let currentRole = isGemini ? "assistant" : "assistant";
   let currentText = [];
 
   const flush = () => {
     const text = currentText.join("\n").trim();
-    if (text) messages.push({ role: currentRole, text: text.replace(/^(You said:|User:|Assistant:|ChatGPT said:|System:)\s*/i, "").trim() });
+    if (text) messages.push({ role: currentRole, text: stripLeadingLabels(text) });
     currentText = [];
   };
 
@@ -352,18 +380,37 @@ function parseMessages(raw, sourceHost = "") {
   }
   flush();
 
-  // Gemini fallback: if still one speaker or only one huge block, alternate turns by paragraph.
-  if (isGemini && (messages.length <= 1 || messages.every(m => m.role === messages[0].role))) {
-    const parts = lines.join("\n").split(/\n{2,}/).map(s => s.trim()).filter(Boolean);
+  // Strong Gemini fallback: no markers or one speaker → alternate by paragraph starting with USER
+  const onlyOneSpeaker = messages.length <= 1 || messages.every(m => m.role === messages[0].role);
+  if (isGemini && onlyOneSpeaker) {
+    const paras = String(raw)
+      .split(/\n{2,}/)
+      .map(s => s.trim())
+      .filter(Boolean);
     let role = "user";
-    const alt = parts.map(p => ({ role: role = (role === "user" ? "assistant" : "user"), text: p }));
-    // Keep at least 2 messages; if only one, just return the single paragraph as assistant to avoid all-blue.
-    return alt.length ? alt : [{ role: "assistant", text: lines.join("\n") }];
+    const alt = paras.map(p => {
+      const m = { role, text: stripLeadingLabels(p) };
+      role = role === "user" ? "assistant" : "user";
+      return m;
+    });
+    if (alt.length >= 2) return alt;
+    return [{ role: "assistant", text: stripLeadingLabels(raw) }];
   }
 
   return messages;
 }
 
+function stripLeadingLabels(s) {
+  return s
+    .replace(/^You said:\s*/i, "")
+    .replace(/^User:\s*/i, "")
+    .replace(/^Assistant:\s*/i, "")
+    .replace(/^ChatGPT said:\s*/i, "")
+    .replace(/^System:\s*/i, "")
+    .trim();
+}
+
+// ---- PDF building (chat bubbles, no labels, RTL-aware) ----
 async function buildStyledPdf(chatText, sourceHost) {
   const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
   const fontBytes = fs.readFileSync(fontPath);
@@ -407,7 +454,9 @@ async function buildStyledPdf(chatText, sourceHost) {
     for (const rawLine of lines) {
       const shaped = shapeBidi(rawLine);
       const logicalWidth = font.widthOfTextAtSize(rawLine, fontSize);
-      const tx = rightSide ? bubbleX + maxBubbleWidth - bubblePad - logicalWidth : bubbleX + bubblePad;
+      const tx = (/\u0590-\u05FF|\u0600-\u06FF/.test(rawLine) || rightSide)
+        ? bubbleX + maxBubbleWidth - bubblePad - logicalWidth
+        : bubbleX + bubblePad;
       page.drawText(shaped, { x: tx, y: textY, size: fontSize, font, color: fg });
       textY -= lineHeight;
     }
@@ -416,16 +465,6 @@ async function buildStyledPdf(chatText, sourceHost) {
   }
 
   return pdfDoc.save();
-}
-
-function stripLeadingLabels(s) {
-  return s
-    .replace(/^You said:\s*/i, "")
-    .replace(/^User:\s*/i, "")
-    .replace(/^Assistant:\s*/i, "")
-    .replace(/^ChatGPT said:\s*/i, "")
-    .replace(/^System:\s*/i, "")
-    .trim();
 }
 
 // ---- Helpers ----

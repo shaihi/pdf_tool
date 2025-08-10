@@ -1,7 +1,7 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "pages/api/export.js": {
-      "runtime": "nodejs20.x",
       "memory": 1536,
       "maxDuration": 60
     }

@@ -1,9 +1,9 @@
-// pages/api/export.js
 import { PDFDocument, rgb } from "pdf-lib";
 import { htmlToText } from "html-to-text";
 import puppeteer from "puppeteer-core";
 import fs from "fs";
 import path from "path";
+import fontkit from "fontkit";
 
 function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
@@ -149,8 +149,8 @@ async function safeDisconnect(browser) {
 async function renderPdf(finalText, title, res) {
   try {
     const pdfDoc = await PDFDocument.create();
+    pdfDoc.registerFontkit(fontkit);
 
-    // Load the Unicode font from /public/fonts
     const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
     const fontBytes = fs.readFileSync(fontPath);
     const customFont = await pdfDoc.embedFont(fontBytes);

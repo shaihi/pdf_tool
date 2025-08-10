@@ -8,17 +8,15 @@
     "start": "next start"
   },
   "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
     "@sparticuz/chromium": "130.0.0",
     "html-to-text": "9.0.5",
+    "jszip": "^3.10.1",
     "next": "14.2.5",
     "pdf-lib": "1.17.1",
-    "@pdf-lib/fontkit": "^1.1.1",
     "puppeteer-core": "22.15.0",
     "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "jszip": "^3.10.1"
+    "react-dom": "18.2.0"
   },
-  "engines": {
-    "node": "20.x"
-  }
+  "engines": { "node": "20.x" }
 }

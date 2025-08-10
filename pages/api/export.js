@@ -175,6 +175,7 @@ async function scrapeChat(url, browser) {
   await page.setExtraHTTPHeaders({
     "Accept-Language": "en-US,en;q=0.9",
     Referer: new URL(url).origin + "/",
+    "Upgrade-Insecure-Requests": "1",
   });
 
   const resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 }).catch((e) => e);
@@ -186,23 +187,23 @@ async function scrapeChat(url, browser) {
 
   const hostname = new URL(url).hostname;
 
-  // Try granular extraction for Gemini: each listitem is a turn
   let extracted;
   if (hostname.includes("gemini.google.com")) {
+    // Try to read individual turns. If none, fall back to main text.
     extracted = await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll('c-wiz[role="list"] [role="listitem"], [role="listitem"]'));
-      const blocks = items.map(el => el.innerText?.trim()).filter(Boolean);
-      // Fallback: whole main text
-      if (blocks.length === 0) {
-        const m = document.querySelector('main');
-        return m?.innerText?.trim() || "";
+      const turns = Array.from(document.querySelectorAll('c-wiz[role="list"] [role="listitem"], [role="listitem"]'))
+        .map(el => el.innerText?.trim())
+        .filter(Boolean);
+
+      if (turns.length > 0) {
+        return turns.join("\n\n---TURN---\n\n");
       }
-      return blocks.join("\n\n---TURN---\n\n"); // delimiter for parse phase
+      const main = document.querySelector("main");
+      return main?.innerText?.trim() || "";
     });
   }
 
   if (!extracted || extracted.length < 60) {
-    // generic extraction
     const selectors = getSelectorsForDomain(hostname);
     extracted = await page.evaluate((sels) => {
       const pile = [];
@@ -227,7 +228,38 @@ async function scrapeChat(url, browser) {
   }
 
   await page.close();
+
+  // NEW: remove Gemini’s page header noise so the first "turn" becomes the user Q
+  if (hostname.includes("gemini.google.com")) {
+    extracted = stripGeminiHeader(extracted);
+  }
+
   return extracted.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function stripGeminiHeader(s) {
+  // Drop the top "Gemini … Created with 2.5 … Published … Google Search …" block and the share URL line.
+  const lines = s.split(/\n+/);
+  const cleaned = [];
+  let inHeader = true;
+  for (const line of lines) {
+    const L = line.trim();
+    if (!inHeader) { cleaned.push(L); continue; }
+    // While we are still in the header, keep skipping until we hit real content.
+    if (
+      /^gemini\b/i.test(L) ||
+      /^https:\/\/g\.co\/gemini\/share\//i.test(L) ||
+      /^(created with|published)/i.test(L) ||
+      /google search/i.test(L) ||
+      /^flash\s/i.test(L)
+    ) {
+      continue;
+    }
+    // first non-header line -> switch off header skipping
+    inHeader = false;
+    if (L) cleaned.push(L);
+  }
+  return cleaned.join("\n");
 }
 
 function getSelectorsForDomain(hostname) {
@@ -263,21 +295,28 @@ function shapeBidi(line) {
 function parseMessages(raw, sourceHost = "") {
   const isGemini = /gemini\.google\.com$/.test(sourceHost);
 
-  // If scraper inserted explicit turn separators for Gemini, use them
+  // If explicit turn separators were inserted, alternate starting with user.
   if (isGemini && raw.includes('---TURN---')) {
     const parts = raw.split(/\n?\s*---TURN---\s?\n?/).map(s => s.trim()).filter(Boolean);
-    // Start with USER on Gemini; alternate
     let role = "user";
     return parts.map(p => {
-      const m = { role, text: p.replace(/^(You said:|User:|Assistant:|ChatGPT said:)\s*/i, "").trim() };
+      const text = p.replace(/^(You said:|User:|Assistant:|ChatGPT said:|System:)\s*/i, "").trim();
+      const m = { role, text };
       role = role === "user" ? "assistant" : "user";
       return m;
     });
   }
 
-  // Generic marker-based parsing
   const dropExact = [/^sources?$/i, /^thought for \d+s$/i];
-  const lines = String(raw).split(/\n+/).map(s => s.trim()).filter(s => s && !dropExact.some(rx => rx.test(s)));
+  const dropStarts = [
+    /^community\.vercel\.com/i, /^uibakery\.io/i, /^tekpon\.com/i, /^toolsforhumans\.ai/i, /^vercel\.com$/i,
+    /^https:\/\/g\.co\/gemini\/share\//i, /^created with/i, /^published/i, /^google search/i, /^flash\s/i, /^gemini\b/i
+  ];
+
+  const lines = String(raw)
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s && !dropExact.some((rx) => rx.test(s)) && !dropStarts.some((rx) => rx.test(s)));
 
   const paragraphs = [];
   let buf = [];
@@ -292,7 +331,6 @@ function parseMessages(raw, sourceHost = "") {
   if (buf.length) paragraphs.push(buf.join(" ").trim());
 
   const messages = [];
-  // Start with USER on Gemini when no clear markers; otherwise assistant
   let currentRole = isGemini ? "user" : "assistant";
   let currentText = [];
 
@@ -314,11 +352,15 @@ function parseMessages(raw, sourceHost = "") {
   }
   flush();
 
-  if (messages.length && messages.every(m => m.role === messages[0].role)) {
-    // All same → alternate for readability
-    let r = isGemini ? "user" : "assistant";
-    for (const m of messages) { m.role = r; r = r === "user" ? "assistant" : "user"; }
+  // Gemini fallback: if still one speaker or only one huge block, alternate turns by paragraph.
+  if (isGemini && (messages.length <= 1 || messages.every(m => m.role === messages[0].role))) {
+    const parts = lines.join("\n").split(/\n{2,}/).map(s => s.trim()).filter(Boolean);
+    let role = "user";
+    const alt = parts.map(p => ({ role: role = (role === "user" ? "assistant" : "user"), text: p }));
+    // Keep at least 2 messages; if only one, just return the single paragraph as assistant to avoid all-blue.
+    return alt.length ? alt : [{ role: "assistant", text: lines.join("\n") }];
   }
+
   return messages;
 }
 

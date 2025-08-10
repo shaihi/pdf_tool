@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { htmlToText } from "html-to-text";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -7,9 +8,25 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { title = "Chat Export", content = "" } = req.body || {};
-    if (!content || !content.trim()) {
-      return res.status(400).send("No content provided.");
+    const { title = "Chat Export", content = "", url = "" } = req.body || {};
+
+    let finalText = "";
+    if (url && typeof url === "string" && /^https?:\/\//i.test(url)) {
+      const fetched = await fetch(url);
+      if (!fetched.ok) {
+        return res.status(400).send(`Could not fetch URL (status ${fetched.status}).`);
+      }
+      const html = await fetched.text();
+      finalText = htmlToText(html, {
+        selectors: [{ selector: "script,style,nav,footer,header", format: "skip" }],
+        wordwrap: false,
+      }).trim();
+    } else if (content && content.trim()) {
+      finalText = String(content).trim();
+    }
+
+    if (!finalText) {
+      return res.status(400).send("No content to export. Paste text or a valid URL.");
     }
 
     const pdfDoc = await PDFDocument.create();
@@ -26,9 +43,8 @@ export default async function handler(req, res) {
     let page = pdfDoc.addPage([pageWidth, pageHeight]);
     let y = pageHeight - pageMargin;
 
-    // Draw title
+    // Title
     const titleText = String(title || "Chat Export");
-    const titleWidth = fontBold.widthOfTextAtSize(titleText, fontSizeTitle);
     page.drawText(titleText, {
       x: pageMargin,
       y: y - fontSizeTitle,
@@ -38,9 +54,9 @@ export default async function handler(req, res) {
     });
     y -= (fontSizeTitle + 20);
 
-    // Word-wrap function
+    // Wrap body text
     const maxWidth = pageWidth - pageMargin * 2;
-    const words = String(content).replace(/\r\n/g, "\n").split(/\s+/);
+    const words = String(finalText).replace(/\r\n/g, "\n").split(/\s+/);
     let line = "";
 
     function commitLine(lineText) {

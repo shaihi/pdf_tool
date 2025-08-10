@@ -15,7 +15,7 @@ const ALLOWED_DOMAINS = [
   "gemini.google.com",
   "x.ai",
   "grok.com",
-  "claude.ai"
+  "claude.ai",
   "lechat.mistral.ai",
 ];
 const MAX_URL_LENGTH = 500;

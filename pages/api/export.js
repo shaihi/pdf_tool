@@ -148,12 +148,11 @@ async function safeDisconnect(browser) {
 
 async function renderPdf(finalText, title, res) {
   try {
-    const pdfDoc = await PDFDocument.create();
-    pdfDoc.registerFontkit(fontkit);
+    // Strip/replace unsupported characters (keep ASCII only)
+    const sanitizedText = String(finalText).replace(/[^\x00-\x7F]/g, '?');
 
-    const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
-    const fontBytes = fs.readFileSync(fontPath);
-    const customFont = await pdfDoc.embedFont(fontBytes);
+    const pdfDoc = await PDFDocument.create();
+    const customFont = await pdfDoc.embedFont(PDFDocument.PDFFonts.Helvetica); // built-in font
 
     const pageMargin = 50, pageWidth = 595.28, pageHeight = 841.89;
     const fontSizeTitle = 18, fontSizeBody = 11, lineHeight = 15;
@@ -167,7 +166,7 @@ async function renderPdf(finalText, title, res) {
     y -= fontSizeTitle + 20;
 
     const maxWidth = pageWidth - pageMargin * 2;
-    const words = String(finalText).replace(/\r\n/g, "\n").split(/\s+/);
+    const words = sanitizedText.replace(/\r\n/g, "\n").split(/\s+/);
     let line = "";
     const commit = (t) => {
       if (y < pageMargin + lineHeight) { page = pdfDoc.addPage([pageWidth, pageHeight]); y = pageHeight - pageMargin; }

@@ -7,6 +7,8 @@ function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms)); // replaces page.waitForTimeout
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", ["POST"]);
@@ -15,24 +17,20 @@ export default async function handler(req, res) {
 
   const { title = "Chat Export", content = "", url = "" } = req.body || {};
 
-  // If raw text is provided, skip the browser entirely
+  // If raw text is provided, skip the browser
   if (!url || !/^https?:\/\//i.test(url)) {
-    if (!content?.trim()) {
-      return error(res, 400, "INVALID_INPUT", "Provide chat text or a share URL.");
-    }
+    if (!content?.trim()) return error(res, 400, "INVALID_INPUT", "Provide chat text or a share URL.");
     return renderPdf(content.trim(), title, res);
   }
 
   // Validate URL
   try { new URL(url); } catch { return error(res, 400, "INVALID_URL", "Invalid URL.", { url }); }
 
-  // ---- FORCE Browserless (hosted Chrome) ----
-  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
+  // Connect to Browserless via WebSocket (use production-sfo host)
+  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL; // wss://production-sfo.browserless.io?token=...
   if (!BROWSERLESS_WS_URL) {
-    return error(
-      res, 500, "BROWSERLESS_MISSING",
-      "Set BROWSERLESS_WS_URL in Vercel → Settings → Environment Variables."
-    );
+    return error(res, 500, "BROWSERLESS_MISSING",
+      "Set BROWSERLESS_WS_URL in Vercel → Settings → Environment Variables.");
   }
 
   let browser;
@@ -55,23 +53,29 @@ export default async function handler(req, res) {
     if (!resp || (typeof resp.status === "function" && resp.status() >= 400)) {
       const status = typeof resp?.status === "function" ? resp.status() : 0;
       await safeDisconnect(browser);
-      return error(res, 400, "NAVIGATION_FAILED_STATUS", `Navigation failed with status ${status || "unknown"}.`, { url, status });
+      return error(res, 400, "NAVIGATION_FAILED_STATUS",
+        `Navigation failed with status ${status || "unknown"}.`, { url, status });
     }
 
-    // Best-effort: dismiss cookie/consent banners
+    // Best-effort: dismiss banners
     await safeClickByText(page, ["Accept", "I agree", "Got it", "Continue"]);
-    await page.waitForTimeout(800);
+    await sleep(800);
 
     // Likely chat containers on share pages
     const candidateSelectors = [
-      '[data-message-author]', '[data-message-id]', '[data-testid="conversation-turn"]',
-      'article', 'main [class*="conversation"]', 'main', '#__next'
+      '[data-testid="conversation-turn"]',
+      '[data-message-author]',
+      '[data-message-id]',
+      'article',
+      'main [class*="conversation"]',
+      'main',
+      '#__next'
     ];
 
     try { await page.waitForSelector(candidateSelectors.join(","), { timeout: 8000 }); } catch {}
-    await page.waitForTimeout(1200);
+    await sleep(1200);
     await safeClickByText(page, ["Show more", "Expand", "See more"]);
-    await page.waitForTimeout(500);
+    await sleep(500);
 
     // Extract visible text
     let extracted = await page.evaluate((sels) => {
@@ -94,7 +98,7 @@ export default async function handler(req, res) {
       return pile.join("\n\n");
     }, candidateSelectors);
 
-    // Fallback: use rendered HTML -> text
+    // Fallback: rendered HTML -> text
     if (!extracted || extracted.length < 60) {
       const html = await page.content();
       try {
@@ -115,9 +119,9 @@ export default async function handler(req, res) {
     await safeDisconnect(browser);
 
     if (!extracted || extracted.length < 60) {
-      return error(res, 422, "EXTRACT_EMPTY", "Fetched the page but could not find readable chat text.", {
-        url, extractedLength: extracted?.length || 0
-      });
+      return error(res, 422, "EXTRACT_EMPTY",
+        "Fetched the page but could not find readable chat text.",
+        { url, extractedLength: extracted?.length || 0 });
     }
 
     const finalText = extracted.replace(/\n{3,}/g, "\n\n").trim();

@@ -1,9 +1,6 @@
-import { PDFDocument, rgb } from "pdf-lib";
+import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 import { htmlToText } from "html-to-text";
 import puppeteer from "puppeteer-core";
-import fs from "fs";
-import path from "path";
-import fontkit from "fontkit";
 
 function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
@@ -148,34 +145,52 @@ async function safeDisconnect(browser) {
 
 async function renderPdf(finalText, title, res) {
   try {
-    // Strip/replace unsupported characters (keep ASCII only)
+    // Strip all non-ASCII characters
     const sanitizedText = String(finalText).replace(/[^\x00-\x7F]/g, '?');
 
     const pdfDoc = await PDFDocument.create();
-    const customFont = await pdfDoc.embedFont(PDFDocument.PDFFonts.Helvetica); // built-in font
+    const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
-    const pageMargin = 50, pageWidth = 595.28, pageHeight = 841.89;
-    const fontSizeTitle = 18, fontSizeBody = 11, lineHeight = 15;
+    const pageMargin = 50;
+    const pageWidth = 595.28;
+    const pageHeight = 841.89;
+    const fontSizeTitle = 18;
+    const fontSizeBody = 11;
+    const lineHeight = 15;
 
     let page = pdfDoc.addPage([pageWidth, pageHeight]);
     let y = pageHeight - pageMargin;
 
     page.drawText(String(title || "Chat Export"), {
-      x: pageMargin, y: y - fontSizeTitle, size: fontSizeTitle, font: customFont, color: rgb(0,0,0)
+      x: pageMargin,
+      y: y - fontSizeTitle,
+      size: fontSizeTitle,
+      font: helveticaFont,
+      color: rgb(0, 0, 0)
     });
     y -= fontSizeTitle + 20;
 
     const maxWidth = pageWidth - pageMargin * 2;
     const words = sanitizedText.replace(/\r\n/g, "\n").split(/\s+/);
     let line = "";
+
     const commit = (t) => {
-      if (y < pageMargin + lineHeight) { page = pdfDoc.addPage([pageWidth, pageHeight]); y = pageHeight - pageMargin; }
-      page.drawText(t, { x: pageMargin, y, size: fontSizeBody, font: customFont, color: rgb(0,0,0) });
+      if (y < pageMargin + lineHeight) {
+        page = pdfDoc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - pageMargin;
+      }
+      page.drawText(t, { x: pageMargin, y, size: fontSizeBody, font: helveticaFont, color: rgb(0, 0, 0) });
       y -= lineHeight;
     };
+
     for (const w of words) {
       const test = line ? line + " " + w : w;
-      if (customFont.widthOfTextAtSize(test, fontSizeBody) > maxWidth) { commit(line); line = w; } else { line = test; }
+      if (helveticaFont.widthOfTextAtSize(test, fontSizeBody) > maxWidth) {
+        commit(line);
+        line = w;
+      } else {
+        line = test;
+      }
     }
     if (line) commit(line);
 

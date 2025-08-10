@@ -4,24 +4,21 @@ export default function Home() {
   const [title, setTitle] = useState("Chat Export");
   const [input, setInput] = useState("");
   const [downloading, setDownloading] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(null); // { message, suggestions[], details? }
 
-  const handleSubmit = async (e) => {
+  async function handleSubmit(e) {
     e.preventDefault();
-    setError("");
+    setError(null);
     if (!input.trim()) {
-      setError("Paste chat text or a share URL.");
+      setError({ message: "Paste chat text or a share URL." });
       return;
     }
     setDownloading(true);
     try {
       const payload = {};
       const maybeUrl = input.trim();
-      if (/^https?:\/\//i.test(maybeUrl)) {
-        payload.url = maybeUrl;
-      } else {
-        payload.content = input;
-      }
+      if (/^https?:\/\//i.test(maybeUrl)) payload.url = maybeUrl;
+      else payload.content = input;
       payload.title = title;
 
       const res = await fetch("/api/export", {
@@ -29,31 +26,41 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+
       if (!res.ok) {
-        const t = await res.text();
-        throw new Error(t || `Request failed with ${res.status}`);
+        // Try JSON first for structured error
+        const ct = res.headers.get("content-type") || "";
+        let problem;
+        if (ct.includes("application/json")) {
+          problem = await res.json();
+        } else {
+          problem = { message: await res.text() };
+        }
+        setError(problem);
+        return;
       }
+
       const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
+      const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `${title || "chat"}.pdf`;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      setError(err.message || "Failed to export PDF.");
+      URL.revokeObjectURL(url);
+    } catch (e2) {
+      setError({ message: e2?.message || "Failed to export PDF." });
     } finally {
       setDownloading(false);
     }
-  };
+  }
 
   return (
     <main style={{ maxWidth: 800, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
       <h1 style={{ fontSize: 28, marginBottom: 8 }}>Chat ➜ PDF Export</h1>
       <p style={{ color: "#555", marginBottom: 16 }}>
-        Paste a <b>shared chat URL</b> (ChatGPT/Gemini/etc) <i>or</i> paste the chat <b>text</b>. Set a title and download as PDF.
+        Paste a <b>shared chat URL</b> (ChatGPT/Gemini/etc) <i>or</i> the chat <b>text</b>. Then download as PDF.
       </p>
 
       <form onSubmit={handleSubmit}>
@@ -73,7 +80,7 @@ export default function Home() {
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Paste chat text, or a link like https://chatgpt.com/share/..."
+            placeholder="Paste chat text or a link like https://chatgpt.com/share/..."
             rows={16}
             style={{ width: "100%", padding: 8, marginTop: 4 }}
           />
@@ -87,12 +94,25 @@ export default function Home() {
           {downloading ? "Generating..." : "Download PDF"}
         </button>
 
-        {error && <div style={{ color: "crimson", marginTop: 12 }}>{error}</div>}
+        {error && (
+          <div style={{ marginTop: 12, padding: 12, border: "1px solid #f1c0c0", background: "#fff5f5", borderRadius: 8 }}>
+            <div style={{ color: "#a40000", fontWeight: 600 }}>
+              {error.message || "Something went wrong."}
+            </div>
+            {Array.isArray(error.suggestions) && (
+              <ul style={{ marginTop: 8, color: "#444" }}>
+                {error.suggestions.map((s, i) => <li key={i}>{s}</li>)}
+              </ul>
+            )}
+            {error.details && (
+              <details style={{ marginTop: 8 }}>
+                <summary>Technical details</summary>
+                <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(error.details, null, 2)}</pre>
+              </details>
+            )}
+          </div>
+        )}
       </form>
-
-      <div style={{ marginTop: 24, color: "#666", fontSize: 14 }}>
-        Notes: For some share pages, content extraction may vary. If a URL fails, paste the plain text instead.
-      </div>
     </main>
   );
 }

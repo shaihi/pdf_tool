@@ -1,22 +1,26 @@
-import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
+import { PDFDocument, rgb } from "pdf-lib";
+import fontkit from "@pdf-lib/fontkit";
 import { htmlToText } from "html-to-text";
 import puppeteer from "puppeteer-core";
 import JSZip from "jszip";
-
-function error(res, status, code, message, details = {}) {
-  return res.status(status).json({ ok: false, code, message, details });
-}
+import fs from "fs";
+import path from "path";
 
 const ALLOWED_DOMAINS = [
   "chat.openai.com",
   "chatgpt.com",
   "gemini.google.com",
-  "x.ai",           // Grok
-  "grok.com",       // Grok alternative domain
+  "x.ai",
+  "grok.com",
   "lechat.mistral.ai"
 ];
+
 const MAX_URL_LENGTH = 500;
 const MAX_TEXT_LENGTH = 50000;
+
+function error(res, status, code, message, details = {}) {
+  return res.status(status).json({ ok: false, code, message, details });
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -27,19 +31,13 @@ export default async function handler(req, res) {
   let { title = "Chat Export", urls = [], content = "" } = req.body || {};
   if (!Array.isArray(urls)) urls = urls ? [urls] : [];
 
-  if (urls.length === 0 && !content?.trim()) {
-    return error(res, 400, "INVALID_INPUT", "Provide at least one chat URL or some chat text.");
-  }
-
   // Title sanitization
   title = String(title).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 100) || "chat";
 
-  // If only content provided → single PDF mode
   if (urls.length === 0 && content?.trim()) {
     return renderSinglePdf(content.trim(), title, res);
   }
 
-  // Multi-URL processing
   const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
   if (!BROWSERLESS_WS_URL) {
     return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
@@ -58,7 +56,6 @@ export default async function handler(req, res) {
 
   for (const url of urls) {
     if (typeof url !== "string" || url.length > MAX_URL_LENGTH) continue;
-
     let hostname;
     try { hostname = new URL(url).hostname; } catch { continue; }
     if (!ALLOWED_DOMAINS.some(d => hostname.endsWith(d))) continue;
@@ -119,7 +116,6 @@ async function scrapeChat(url, browser) {
   }
 
   await page.close();
-
   return extracted.replace(/\n{3,}/g, "\n\n").trim();
 }
 
@@ -140,42 +136,51 @@ function getSelectorsForDomain(hostname) {
 }
 
 async function buildStyledPdf(chatText, sourceHost) {
-  const sanitizedText = String(chatText).replace(/[^\x00-\x7F]/g, '?');
-  const messages = sanitizedText.split(/\n\s*\n/).map(block => {
-    const trimmed = block.trim();
-    if (/^(User:|Me:|You:|What|Can I|Which|Once I|How|Why)/i.test(trimmed)) {
-      return { role: "User", text: trimmed.replace(/^User:\s*/i, "") };
-    }
-    return { role: "Assistant", text: trimmed.replace(/^Assistant:\s*/i, "") };
-  });
+  const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
+  const fontBytes = fs.readFileSync(fontPath);
 
   const pdfDoc = await PDFDocument.create();
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-  const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  pdfDoc.registerFontkit(fontkit);
+  const customFont = await pdfDoc.embedFont(fontBytes);
 
   const pageWidth = 595.28;
   const pageHeight = 841.89;
   const margin = 40;
   const bubblePadding = 10;
   const bubbleRadius = 8;
-  const fontSize = 11;
-  const lineHeight = 14;
+  const fontSize = 12;
+  const lineHeight = 16;
+
+  const messages = chatText.split(/\n\s*\n/).map(block => {
+    const trimmed = block.trim();
+    if (/^system:/i.test(trimmed)) return { role: "System", text: trimmed.replace(/^system:\s*/i, "") };
+    if (/^user:/i.test(trimmed)) return { role: "User", text: trimmed.replace(/^user:\s*/i, "") };
+    if (/^assistant:/i.test(trimmed)) return { role: "Assistant", text: trimmed.replace(/^assistant:\s*/i, "") };
+    return { role: "Assistant", text: trimmed };
+  });
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
   let y = pageHeight - margin;
 
   page.drawText(`Chat Export - ${sourceHost}`, {
-    x: margin, y, size: 16, font: fontBold, color: rgb(0, 0, 0)
+    x: margin,
+    y,
+    size: 16,
+    font: customFont,
+    color: rgb(0, 0, 0)
   });
   y -= 24;
 
   for (const { role, text } of messages) {
-    const bgColor = role === "User" ? rgb(0.85, 0.92, 1) : rgb(0.95, 0.95, 0.95);
-    const roleLabel = `${role}:`;
+    const bgColor =
+      role === "System" ? rgb(1, 1, 0.85) :
+      role === "User" ? rgb(0.85, 0.92, 1) :
+      rgb(0.95, 0.95, 0.95);
 
-    const wrappedLines = wrapText(text, fontRegular, fontSize, pageWidth - margin * 2 - bubblePadding * 2);
+    const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(text);
+    const wrappedLines = wrapText(text, customFont, fontSize, pageWidth - margin * 2 - bubblePadding * 2);
+
     const bubbleHeight = (wrappedLines.length + 1) * lineHeight + bubblePadding * 2;
-
     if (y - bubbleHeight < margin) {
       page = pdfDoc.addPage([pageWidth, pageHeight]);
       y = pageHeight - margin;
@@ -190,21 +195,24 @@ async function buildStyledPdf(chatText, sourceHost) {
       borderRadius: bubbleRadius
     });
 
-    page.drawText(roleLabel, {
+    let textY = y - bubblePadding - fontSize;
+    page.drawText(`${role}:`, {
       x: margin + bubblePadding,
-      y: y - bubblePadding - fontSize,
+      y: textY,
       size: fontSize,
-      font: fontBold,
+      font: customFont,
       color: rgb(0, 0, 0)
     });
+    textY -= lineHeight;
 
-    let textY = y - bubblePadding - fontSize - lineHeight;
     for (const line of wrappedLines) {
       page.drawText(line, {
-        x: margin + bubblePadding,
+        x: isRTL
+          ? pageWidth - margin - bubblePadding - customFont.widthOfTextAtSize(line, fontSize)
+          : margin + bubblePadding,
         y: textY,
         size: fontSize,
-        font: fontRegular,
+        font: customFont,
         color: rgb(0, 0, 0)
       });
       textY -= lineHeight;

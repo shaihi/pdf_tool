@@ -1,21 +1,26 @@
 import { useState } from "react";
 
 export default function Home() {
-  const [urls, setUrls] = useState("");
+  const [urls, setUrls] = useState([""]);
   const [title, setTitle] = useState("Chat Export");
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
+
+  const updateUrl = (idx, value) => {
+    const newUrls = [...urls];
+    newUrls[idx] = value;
+    setUrls(newUrls);
+  };
+
+  const addUrlField = () => setUrls([...urls, ""]);
+  const removeUrlField = (idx) => setUrls(urls.filter((_, i) => i !== idx));
 
   async function handleExport() {
     setErrorMsg("");
     setLoading(true);
     try {
-      const urlArray = urls
-        .split("\n")
-        .map(u => u.trim())
-        .filter(Boolean);
-
-      if (urlArray.length === 0) {
+      const cleanUrls = urls.map(u => u.trim()).filter(Boolean);
+      if (cleanUrls.length === 0) {
         setErrorMsg("Please enter at least one chat share link.");
         setLoading(false);
         return;
@@ -24,7 +29,7 @@ export default function Home() {
       const res = await fetch("/api/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, urls: urlArray })
+        body: JSON.stringify({ title, urls: cleanUrls })
       });
 
       if (!res.ok) {
@@ -52,14 +57,26 @@ export default function Home() {
   return (
     <div style={{ maxWidth: 600, margin: "40px auto", fontFamily: "sans-serif" }}>
       <h1>Multi-Chat Export</h1>
-      <p>Paste one or more chat share links (ChatGPT, Gemini, Grok, LeChat, etc.), one per line:</p>
-      <textarea
-        value={urls}
-        onChange={e => setUrls(e.target.value)}
-        rows={8}
-        style={{ width: "100%", padding: "8px", marginBottom: "10px" }}
-        placeholder="https://chatgpt.com/share/XXXX\nhttps://gemini.google.com/share/YYYY"
-      />
+      {urls.map((u, i) => (
+        <div key={i} style={{ display: "flex", marginBottom: 10 }}>
+          <input
+            type="text"
+            value={u}
+            onChange={(e) => updateUrl(i, e.target.value)}
+            placeholder={`Chat link #${i + 1}`}
+            style={{ flex: 1, padding: "8px" }}
+          />
+          {i > 0 && (
+            <button
+              onClick={() => removeUrlField(i)}
+              style={{ marginLeft: 5 }}
+            >
+              -
+            </button>
+          )}
+        </div>
+      ))}
+      <button onClick={addUrlField} style={{ marginBottom: 10 }}>+ Add URL</button>
       <input
         type="text"
         value={title}

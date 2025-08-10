@@ -141,72 +141,68 @@ async function buildStyledPdf(chatText, sourceHost) {
 
   const pdfDoc = await PDFDocument.create();
   pdfDoc.registerFontkit(fontkit);
-  const customFont = await pdfDoc.embedFont(fontBytes);
+  const font = await pdfDoc.embedFont(fontBytes);
 
-  const pageWidth = 595.28;
-  const pageHeight = 841.89;
-  const margin = 40;
-  const bubblePadding = 10;
-  const bubbleRadius = 8;
+  const pageWidth = 595.28, pageHeight = 841.89;
+  const margin = 36;
+  const maxBubbleWidth = Math.floor((pageWidth - margin * 2) * 0.70);
+  const bubblePad = 10;
+  const radius = 10;
   const fontSize = 12;
   const lineHeight = 16;
 
-  // Remove labels from text, keep only role info
-  const messages = chatText.split(/\n\s*\n/).map(block => {
-    const trimmed = block.trim();
-    if (/^system:/i.test(trimmed)) return { role: "System", text: trimmed.replace(/^system:\s*/i, "") };
-    if (/^user:/i.test(trimmed)) return { role: "User", text: trimmed.replace(/^user:\s*/i, "") };
-    if (/^assistant:/i.test(trimmed)) return { role: "Assistant", text: trimmed.replace(/^assistant:\s*/i, "") };
-    return { role: "Assistant", text: trimmed };
-  });
+  // NEW: structured messages
+  const messages = parseMessages(chatText);
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
   let y = pageHeight - margin;
 
+  // Title
   page.drawText(`Chat Export - ${sourceHost}`, {
-    x: margin,
-    y,
-    size: 16,
-    font: customFont,
-    color: rgb(0, 0, 0)
+    x: margin, y, size: 16, font, color: rgb(0, 0, 0)
   });
-  y -= 24;
+  y -= 26;
 
-  for (const { role, text } of messages) {
-    const bgColor =
-      role === "System" ? rgb(1, 1, 0.85) :
-      role === "User" ? rgb(0.8, 0.9, 1) : // light blue
-      rgb(0.85, 1, 0.85); // light green for assistant
+  for (const m of messages) {
+    const isUser = m.role === "user";
+    const isSystem = m.role === "system";
 
-    const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(text);
-    const wrappedLines = wrapText(text, customFont, fontSize, pageWidth - margin * 2 - bubblePadding * 2);
+    // Visible colors
+    const bg = isSystem ? rgb(1.00, 0.98, 0.78)       // light yellow
+             : isUser  ? rgb(0.16, 0.45, 0.90)       // blue
+                        : rgb(0.88, 0.90, 0.96);     // gray-blue
+    const fg = isUser ? rgb(1, 1, 1) : rgb(0, 0, 0);
 
-    const bubbleHeight = wrappedLines.length * lineHeight + bubblePadding * 2;
+    const lines = wrapText(m.text, font, fontSize, maxBubbleWidth - bubblePad * 2);
+    const bubbleHeight = lines.length * lineHeight + bubblePad * 2;
+
     if (y - bubbleHeight < margin) {
       page = pdfDoc.addPage([pageWidth, pageHeight]);
       y = pageHeight - margin;
     }
 
+    const rightSide = isUser; // user → right; assistant/system → left
+    const bubbleX = rightSide ? pageWidth - margin - maxBubbleWidth : margin;
+
+    // Bubble
     page.drawRectangle({
-      x: margin,
+      x: bubbleX,
       y: y - bubbleHeight,
-      width: pageWidth - margin * 2,
+      width: maxBubbleWidth,
       height: bubbleHeight,
-      color: bgColor,
-      borderRadius: bubbleRadius
+      color: bg,
+      borderRadius: radius
     });
 
-    let textY = y - bubblePadding - fontSize;
-    for (const line of wrappedLines) {
-      page.drawText(line, {
-        x: isRTL
-          ? pageWidth - margin - bubblePadding - customFont.widthOfTextAtSize(line, fontSize)
-          : margin + bubblePadding,
-        y: textY,
-        size: fontSize,
-        font: customFont,
-        color: rgb(0, 0, 0)
-      });
+    // Text (line-level RTL)
+    let textY = y - bubblePad - fontSize;
+    for (const line of lines) {
+      const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
+      const lineWidth = font.widthOfTextAtSize(line, fontSize);
+      const tx = (isRTL || rightSide)
+        ? bubbleX + maxBubbleWidth - bubblePad - lineWidth
+        : bubbleX + bubblePad;
+      page.drawText(line, { x: tx, y: textY, size: fontSize, font, color: fg });
       textY -= lineHeight;
     }
 
@@ -214,6 +210,87 @@ async function buildStyledPdf(chatText, sourceHost) {
   }
 
   return pdfDoc.save();
+}
+
+// NEW: parses your exported text into {role, text}[]
+function parseMessages(raw) {
+  // Remove obvious meta-only lines
+  const dropExact = [
+    /^sources$/i,
+    /^source$/i,
+    /^thought for \d+s$/i
+  ];
+  const dropStarts = [
+    /^community\.vercel\.com/i, /^uibakery\.io/i, /^tekpon\.com/i, /^toolsforhumans\.ai/i,
+    /^vercel\.com$/i
+  ];
+
+  const lines = String(raw)
+    .split(/\n+/)
+    .map(s => s.trim())
+    .filter(s => s && !dropExact.some(rx => rx.test(s)) && !dropStarts.some(rx => rx.test(s)));
+
+  // Collapse to paragraphs
+  const paragraphs = [];
+  let buf = [];
+  for (const l of lines) {
+    if (/^(You said:|Assistant:|ChatGPT said:|System:|User:|Assistant)/i.test(l)) {
+      if (buf.length) { paragraphs.push(buf.join(" ").trim()); buf = []; }
+      paragraphs.push(l); // keep marker as its own paragraph
+    } else {
+      buf.push(l);
+    }
+  }
+  if (buf.length) paragraphs.push(buf.join(" ").trim());
+
+  // Build messages using markers, with alternation fallback
+  const messages = [];
+  let currentRole = "assistant"; // start from assistant by default for shared pages
+  let currentText = [];
+
+  const flush = () => {
+    const text = currentText.join("\n").trim();
+    if (text) messages.push({ role: currentRole, text: stripLeadingLabels(text) });
+    currentText = [];
+  };
+
+  for (const p of paragraphs) {
+    const marker =
+      /^You said:/i.test(p) ? "user" :
+      /^User:/i.test(p) ? "user" :
+      /^Assistant:|^ChatGPT said:/i.test(p) ? "assistant" :
+      /^System:/i.test(p) ? "system" : null;
+
+    if (marker) {
+      flush();
+      currentRole = marker;
+    } else {
+      // No explicit marker → append to current block
+      currentText.push(p);
+    }
+  }
+  flush();
+
+  // If everything ended up in one role, do a gentle alternation pass to improve readability
+  const uniqueRoles = new Set(messages.map(m => m.role));
+  if (uniqueRoles.size === 1 && messages.length > 1) {
+    let alt = "assistant";
+    for (const m of messages) {
+      m.role = alt = (alt === "assistant" ? "user" : "assistant");
+    }
+  }
+
+  return messages;
+}
+
+function stripLeadingLabels(s) {
+  return s
+    .replace(/^You said:\s*/i, "")
+    .replace(/^User:\s*/i, "")
+    .replace(/^Assistant:\s*/i, "")
+    .replace(/^ChatGPT said:\s*/i, "")
+    .replace(/^System:\s*/i, "")
+    .trim();
 }
 
 function wrapText(text, font, fontSize, maxWidth) {

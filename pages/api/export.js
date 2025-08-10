@@ -8,6 +8,7 @@ import fs from "fs";
 import path from "path";
 
 // ---- Config / Security ----
+const BLOCKED_DOMAINS = ["claude.ai"]; // explicitly not allowed
 const ALLOWED_DOMAINS = [
   "chat.openai.com",
   "chatgpt.com",
@@ -62,14 +63,23 @@ export default async function handler(req, res) {
   const cleaned = [];
   for (const raw of urls) {
     if (typeof raw !== "string" || !raw.trim() || raw.length > MAX_URL_LENGTH) continue;
+    let u;
     try {
-      const u = new URL(raw);
-      if (!ALLOWED_DOMAINS.some((d) => u.hostname.endsWith(d))) continue;
-      cleaned.push(u);
+      u = new URL(raw);
     } catch {
-      // skip invalid
+      continue;
     }
+    const host = u.hostname.toLowerCase();
+
+    // Blocked domains (Claude)
+    if (BLOCKED_DOMAINS.some((d) => host.endsWith(d))) {
+      return error(res, 400, "DOMAIN_BLOCKED", "This domain is not supported.", { url: raw, domain: host });
+    }
+
+    if (!ALLOWED_DOMAINS.some((d) => host.endsWith(d))) continue;
+    cleaned.push(u);
   }
+
   if (cleaned.length === 0) {
     return error(res, 400, "NO_ALLOWED_URLS", "No URLs with allowed domains were provided.");
   }
@@ -96,10 +106,10 @@ export default async function handler(req, res) {
       const pdfBytes = await buildStyledPdf(text, u.hostname);
       await safeDisconnect(browser);
 
-      const safeBase = u.hostname.replace(/\./g, "_");
+      const base = u.hostname.replace(/\./g, "_");
       const unique = Date.now();
       res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `attachment; filename="${safeBase}_${unique}.pdf"`);
+      res.setHeader("Content-Disposition", `attachment; filename="${base}_${unique}.pdf"`);
       return res.status(200).send(Buffer.from(pdfBytes));
     } catch (e) {
       await safeDisconnect(browser);
@@ -238,7 +248,8 @@ async function buildStyledPdf(chatText, sourceHost) {
   const fontSize = 12;
   const lineHeight = 16;
 
-  const messages = parseMessages(chatText);
+  // Pass host so Gemini starts with user if no markers
+  const messages = parseMessages(chatText, sourceHost);
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
   let y = pageHeight - margin;
@@ -267,7 +278,8 @@ async function buildStyledPdf(chatText, sourceHost) {
       y = pageHeight - margin;
     }
 
-    const rightSide = isUser; // user → right; assistant/system → left
+    // user → right; assistant/system → left
+    const rightSide = isUser;
     const bubbleX = rightSide ? pageWidth - margin - maxBubbleWidth : margin;
 
     // Bubble
@@ -280,15 +292,16 @@ async function buildStyledPdf(chatText, sourceHost) {
       borderRadius: radius
     });
 
-    // Text (line-level RTL awareness + right alignment for user)
+    // Text (line-level RTL using RLE/POP; right align for user & RTL lines)
     let textY = y - bubblePad - fontSize;
-    for (const line of lines) {
-      const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
-      const lineWidth = font.widthOfTextAtSize(line, fontSize);
+    for (const rawLine of lines) {
+      const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(rawLine);
+      const visual = isRTL ? `\u202B${rawLine}\u202C` : rawLine; // force RTL when needed
+      const lineWidth = font.widthOfTextAtSize(rawLine, fontSize); // measure logical sequence
       const tx = (isRTL || rightSide)
         ? bubbleX + maxBubbleWidth - bubblePad - lineWidth
         : bubbleX + bubblePad;
-      page.drawText(line, { x: tx, y: textY, size: fontSize, font, color: fg });
+      page.drawText(visual, { x: tx, y: textY, size: fontSize, font, color: fg });
       textY -= lineHeight;
     }
 
@@ -298,13 +311,10 @@ async function buildStyledPdf(chatText, sourceHost) {
   return pdfDoc.save();
 }
 
-// ---- Role parsing tuned for your exports ----
-function parseMessages(raw) {
+// ---- Role parsing tuned for ChatGPT + Gemini ----
+function parseMessages(raw, sourceHost = "") {
   // Drop obvious meta-only lines
-  const dropExact = [
-    /^sources?$/i,
-    /^thought for \d+s$/i,
-  ];
+  const dropExact = [/^sources?$/i, /^thought for \d+s$/i];
   const dropStarts = [
     /^community\.vercel\.com/i, /^uibakery\.io/i, /^tekpon\.com/i, /^toolsforhumans\.ai/i,
     /^vercel\.com$/i
@@ -315,22 +325,23 @@ function parseMessages(raw) {
     .map((s) => s.trim())
     .filter((s) => s && !dropExact.some((rx) => rx.test(s)) && !dropStarts.some((rx) => rx.test(s)));
 
-  // Collapse to paragraphs with markers separated
+  // Keep marker paragraphs separate
   const paragraphs = [];
   let buf = [];
   for (const l of lines) {
     if (/^(You said:|Assistant:|ChatGPT said:|System:|User:)/i.test(l)) {
       if (buf.length) { paragraphs.push(buf.join(" ").trim()); buf = []; }
-      paragraphs.push(l); // keep marker as its own paragraph
+      paragraphs.push(l);
     } else {
       buf.push(l);
     }
   }
   if (buf.length) paragraphs.push(buf.join(" ").trim());
 
-  // Build messages using markers, with alternation fallback
+  // Build messages using markers; fallback to alternation
   const messages = [];
-  let currentRole = "assistant"; // defaults for shared pages
+  // IMPORTANT: Gemini usually lacks explicit markers — start with USER there
+  let currentRole = /gemini\.google\.com$/.test(sourceHost) ? "user" : "assistant";
   let currentText = [];
 
   const flush = () => {
@@ -355,13 +366,13 @@ function parseMessages(raw) {
   }
   flush();
 
-  // If everything is one role, alternate to improve readability
-  const uniqueRoles = new Set(messages.map((m) => m.role));
-  if (uniqueRoles.size === 1 && messages.length > 1) {
-    let alt = "assistant";
+  // Fallback: if no markers at all (common on Gemini), alternate roles
+  const hasExplicit = messages.some(m => m.role === "user" || m.role === "assistant" || m.role === "system");
+  if (!hasExplicit && messages.length > 0) {
+    let role = /gemini\.google\.com$/.test(sourceHost) ? "user" : "assistant";
     for (const m of messages) {
-      alt = alt === "assistant" ? "user" : "assistant";
-      m.role = alt;
+      m.role = role;
+      role = role === "assistant" ? "user" : "assistant";
     }
   }
 

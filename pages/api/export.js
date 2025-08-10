@@ -1,6 +1,6 @@
+// pages/api/export.js
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { htmlToText } from "html-to-text";
-import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 
 function error(res, status, code, message, details = {}) {
@@ -15,7 +15,7 @@ export default async function handler(req, res) {
 
   const { title = "Chat Export", content = "", url = "" } = req.body || {};
 
-  // If raw text provided, skip browser
+  // If raw text is provided, skip the browser entirely
   if (!url || !/^https?:\/\//i.test(url)) {
     if (!content?.trim()) {
       return error(res, 400, "INVALID_INPUT", "Provide chat text or a share URL.");
@@ -26,28 +26,21 @@ export default async function handler(req, res) {
   // Validate URL
   try { new URL(url); } catch { return error(res, 400, "INVALID_URL", "Invalid URL.", { url }); }
 
-  // Try hosted browser first (Browserless). Set BROWSERLESS_WS_URL in Vercel env.
+  // ---- FORCE Browserless (hosted Chrome) ----
   const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
+  if (!BROWSERLESS_WS_URL) {
+    return error(
+      res, 500, "BROWSERLESS_MISSING",
+      "Set BROWSERLESS_WS_URL in Vercel → Settings → Environment Variables."
+    );
+  }
 
   let browser;
   try {
-    if (BROWSERLESS_WS_URL) {
-      // Connect to hosted Chrome (no local binary; avoids libnss issues)
-      browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
-    } else {
-      // Fallback: launch Sparticuz Chromium in-serverless
-      const executablePath = await chromium.executablePath();
-      browser = await puppeteer.launch({
-        args: chromium.args,
-        defaultViewport: chromium.defaultViewport,
-        executablePath,
-        headless: chromium.headless,
-        ignoreHTTPSErrors: true
-      });
-    }
+    browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
   } catch (e) {
-    return error(res, 502, "BROWSER_LAUNCH_FAILED", "Failed to start headless browser.", {
-      name: e?.name, message: e?.message, usingHosted: Boolean(BROWSERLESS_WS_URL)
+    return error(res, 502, "BROWSER_CONNECT_FAILED", "Could not connect to Browserless.", {
+      name: e?.name, message: e?.message
     });
   }
 
@@ -61,26 +54,26 @@ export default async function handler(req, res) {
     const resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 }).catch((e) => e);
     if (!resp || (typeof resp.status === "function" && resp.status() >= 400)) {
       const status = typeof resp?.status === "function" ? resp.status() : 0;
-      await safeClose(browser, BROWSERLESS_WS_URL);
+      await safeDisconnect(browser);
       return error(res, 400, "NAVIGATION_FAILED_STATUS", `Navigation failed with status ${status || "unknown"}.`, { url, status });
     }
 
-    // Best-effort: dismiss banners
+    // Best-effort: dismiss cookie/consent banners
     await safeClickByText(page, ["Accept", "I agree", "Got it", "Continue"]);
     await page.waitForTimeout(800);
 
-    // Wait for likely chat nodes
+    // Likely chat containers on share pages
     const candidateSelectors = [
       '[data-message-author]', '[data-message-id]', '[data-testid="conversation-turn"]',
       'article', 'main [class*="conversation"]', 'main', '#__next'
     ];
-    try { await page.waitForSelector(candidateSelectors.join(","), { timeout: 8000 }); } catch {}
 
+    try { await page.waitForSelector(candidateSelectors.join(","), { timeout: 8000 }); } catch {}
     await page.waitForTimeout(1200);
     await safeClickByText(page, ["Show more", "Expand", "See more"]);
     await page.waitForTimeout(500);
 
-    // Extract
+    // Extract visible text
     let extracted = await page.evaluate((sels) => {
       const pile = [];
       const seen = new Set();
@@ -101,6 +94,7 @@ export default async function handler(req, res) {
       return pile.join("\n\n");
     }, candidateSelectors);
 
+    // Fallback: use rendered HTML -> text
     if (!extracted || extracted.length < 60) {
       const html = await page.content();
       try {
@@ -118,7 +112,7 @@ export default async function handler(req, res) {
       } catch {}
     }
 
-    await safeClose(browser, BROWSERLESS_WS_URL);
+    await safeDisconnect(browser);
 
     if (!extracted || extracted.length < 60) {
       return error(res, 422, "EXTRACT_EMPTY", "Fetched the page but could not find readable chat text.", {
@@ -129,7 +123,7 @@ export default async function handler(req, res) {
     const finalText = extracted.replace(/\n{3,}/g, "\n\n").trim();
     return renderPdf(finalText, title, res);
   } catch (e) {
-    await safeClose(browser, BROWSERLESS_WS_URL);
+    await safeDisconnect(browser);
     return error(res, 422, "EXTRACT_ERROR", "Failed to extract text from the page.", {
       url, name: e?.name, message: e?.message
     });
@@ -151,8 +145,8 @@ async function safeClickByText(page, labels) {
   } catch {}
 }
 
-async function safeClose(browser, isRemote) {
-  try { isRemote ? await browser.disconnect() : await browser.close(); } catch {}
+async function safeDisconnect(browser) {
+  try { await browser.disconnect(); } catch {}
 }
 
 async function renderPdf(finalText, title, res) {

@@ -1,13 +1,15 @@
 // pages/api/export.js
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { PDFDocument, rgb } from "pdf-lib";
 import { htmlToText } from "html-to-text";
 import puppeteer from "puppeteer-core";
+import fs from "fs";
+import path from "path";
 
 function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms)); // replaces page.waitForTimeout
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -17,20 +19,16 @@ export default async function handler(req, res) {
 
   const { title = "Chat Export", content = "", url = "" } = req.body || {};
 
-  // If raw text is provided, skip the browser
   if (!url || !/^https?:\/\//i.test(url)) {
     if (!content?.trim()) return error(res, 400, "INVALID_INPUT", "Provide chat text or a share URL.");
     return renderPdf(content.trim(), title, res);
   }
 
-  // Validate URL
   try { new URL(url); } catch { return error(res, 400, "INVALID_URL", "Invalid URL.", { url }); }
 
-  // Connect to Browserless via WebSocket (use production-sfo host)
-  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL; // wss://production-sfo.browserless.io?token=...
+  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
   if (!BROWSERLESS_WS_URL) {
-    return error(res, 500, "BROWSERLESS_MISSING",
-      "Set BROWSERLESS_WS_URL in Vercel → Settings → Environment Variables.");
+    return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
   }
 
   let browser;
@@ -57,11 +55,9 @@ export default async function handler(req, res) {
         `Navigation failed with status ${status || "unknown"}.`, { url, status });
     }
 
-    // Best-effort: dismiss banners
     await safeClickByText(page, ["Accept", "I agree", "Got it", "Continue"]);
     await sleep(800);
 
-    // Likely chat containers on share pages
     const candidateSelectors = [
       '[data-testid="conversation-turn"]',
       '[data-message-author]',
@@ -77,7 +73,6 @@ export default async function handler(req, res) {
     await safeClickByText(page, ["Show more", "Expand", "See more"]);
     await sleep(500);
 
-    // Extract visible text
     let extracted = await page.evaluate((sels) => {
       const pile = [];
       const seen = new Set();
@@ -98,7 +93,6 @@ export default async function handler(req, res) {
       return pile.join("\n\n");
     }, candidateSelectors);
 
-    // Fallback: rendered HTML -> text
     if (!extracted || extracted.length < 60) {
       const html = await page.content();
       try {
@@ -134,7 +128,6 @@ export default async function handler(req, res) {
   }
 }
 
-// ---------- helpers ----------
 async function safeClickByText(page, labels) {
   try {
     await page.evaluate((texts) => {
@@ -156,8 +149,11 @@ async function safeDisconnect(browser) {
 async function renderPdf(finalText, title, res) {
   try {
     const pdfDoc = await PDFDocument.create();
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    // Load the Unicode font from /public/fonts
+    const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
+    const fontBytes = fs.readFileSync(fontPath);
+    const customFont = await pdfDoc.embedFont(fontBytes);
 
     const pageMargin = 50, pageWidth = 595.28, pageHeight = 841.89;
     const fontSizeTitle = 18, fontSizeBody = 11, lineHeight = 15;
@@ -166,7 +162,7 @@ async function renderPdf(finalText, title, res) {
     let y = pageHeight - pageMargin;
 
     page.drawText(String(title || "Chat Export"), {
-      x: pageMargin, y: y - fontSizeTitle, size: fontSizeTitle, font: fontBold, color: rgb(0,0,0)
+      x: pageMargin, y: y - fontSizeTitle, size: fontSizeTitle, font: customFont, color: rgb(0,0,0)
     });
     y -= fontSizeTitle + 20;
 
@@ -175,12 +171,12 @@ async function renderPdf(finalText, title, res) {
     let line = "";
     const commit = (t) => {
       if (y < pageMargin + lineHeight) { page = pdfDoc.addPage([pageWidth, pageHeight]); y = pageHeight - pageMargin; }
-      page.drawText(t, { x: pageMargin, y, size: fontSizeBody, font, color: rgb(0,0,0) });
+      page.drawText(t, { x: pageMargin, y, size: fontSizeBody, font: customFont, color: rgb(0,0,0) });
       y -= lineHeight;
     };
     for (const w of words) {
       const test = line ? line + " " + w : w;
-      if (font.widthOfTextAtSize(test, fontSizeBody) > maxWidth) { commit(line); line = w; } else { line = test; }
+      if (customFont.widthOfTextAtSize(test, fontSizeBody) > maxWidth) { commit(line); line = w; } else { line = test; }
     }
     if (line) commit(line);
 

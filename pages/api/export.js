@@ -9,39 +9,29 @@ function error(res, status, code, message, details = {}) {
 
 function suggest(code) {
   const common = [
-    "If this is a share URL, open it in your browser to confirm it loads.",
+    "Open the share URL in your browser to confirm it loads and is public.",
     "If the link fails repeatedly, copy/paste the chat text instead."
   ];
   const map = {
-    INVALID_INPUT: [
-      "Paste chat text or a valid https:// URL.",
-      ...common
-    ],
-    INVALID_URL: [
-      "Double-check the URL format (must start with http:// or https://).",
-      ...common
-    ],
-    FETCH_TIMEOUT: [
-      "The remote site took too long to respond.",
-      "Try again later or paste the chat text.",
-    ],
+    METHOD_NOT_ALLOWED: ["Use POST /api/export"],
+    INVALID_INPUT: ["Paste chat text or a valid https:// URL.", ...common],
+    INVALID_URL: ["URL must start with http:// or https://.", ...common],
+    FETCH_TIMEOUT: ["The remote site took too long to respond.", ...common],
     FETCH_FAILED_STATUS: [
       "The site returned a non-OK status (e.g., 403/404).",
-      "Ensure the link is publicly accessible (not private).",
+      "Ensure the link is public and not permission-gated.",
       ...common
     ],
-    FETCH_ERROR: [
-      "A network/DNS error occurred while fetching the page.",
-      ...common
+    FETCH_ERROR: ["A network/DNS error occurred while fetching the page.", ...common],
+    EXTRACT_ERROR: [
+      "The page loaded but text extraction failed.",
+      "Try pasting the chat text instead of the URL."
     ],
     EXTRACT_EMPTY: [
       "The page loaded but no readable chat text was found.",
-      "Some share pages render content dynamically; paste the text instead.",
+      "Some share pages render dynamically; paste the text instead."
     ],
-    PDF_ERROR: [
-      "PDF generation failed unexpectedly.",
-      "Try with shorter content or paste plain text.",
-    ],
+    PDF_ERROR: ["PDF generation failed unexpectedly.", "Try with shorter content."]
   };
   return map[code] || common;
 }
@@ -61,7 +51,8 @@ export default async function handler(req, res) {
     // 1) Get text either from URL or raw content
     let finalText = "";
 
-    if (url && typeof url === "string") {
+    if (url && typeof url === "string" && url.trim()) {
+      // Validate URL
       let parsed;
       try {
         parsed = new URL(url);
@@ -78,14 +69,13 @@ export default async function handler(req, res) {
           signal: controller.signal,
           redirect: "follow",
           headers: {
-            // Use a realistic UA; some sites respond differently to “generic” agents.
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept":
               "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-          },
+            "Accept-Language": "en-US,en;q=0.9"
+          }
         });
         clearTimeout(timer);
 
@@ -102,24 +92,41 @@ export default async function handler(req, res) {
         const contentType = resp.headers.get("content-type") || "";
         const html = await resp.text();
 
-        // Convert HTML → text
-        finalText = htmlToText(html, {
-          selectors: [{ selector: "script,style,nav,footer,header", format: "skip" }],
-          wordwrap: false,
-          // Try to bias toward main content if present:
-          // (html-to-text supports CSS-like selectors)
-          baseElements: { selectors: ["main", "#__next", "body"] },
-        }).trim();
+        // Convert HTML → text (fixed: one selector object per tag)
+        let extracted = "";
+        try {
+          extracted = htmlToText(html, {
+            selectors: [
+              { selector: "script", format: "skip" },
+              { selector: "style",  format: "skip" },
+              { selector: "nav",    format: "skip" },
+              { selector: "footer", format: "skip" },
+              { selector: "header", format: "skip" }
+            ],
+            wordwrap: false,
+            baseElements: { selectors: ["main", "#__next", "body"] }
+          }).trim();
+        } catch (e) {
+          return error(
+            res,
+            422,
+            "EXTRACT_ERROR",
+            "Parsed the page but failed to extract readable text.",
+            { url, parserMessage: e?.message }
+          );
+        }
 
-        if (!finalText || finalText.length < 40) {
+        if (!extracted || extracted.length < 40) {
           return error(
             res,
             422,
             "EXTRACT_EMPTY",
-            "Fetched page but could not extract readable chat text.",
-            { url, contentType, extractedLength: finalText.length }
+            "Fetched the page but found no readable chat text.",
+            { url, contentType, extractedLength: extracted.length }
           );
         }
+
+        finalText = extracted;
       } catch (err) {
         clearTimeout(timer);
         if (err?.name === "AbortError") {
@@ -128,7 +135,7 @@ export default async function handler(req, res) {
         return error(res, 502, "FETCH_ERROR", "Network error while fetching the URL.", {
           url,
           name: err?.name,
-          message: err?.message,
+          message: err?.message
         });
       }
     } else if (content && content.trim()) {
@@ -156,7 +163,7 @@ export default async function handler(req, res) {
         y: y - fontSizeTitle,
         size: fontSizeTitle,
         font: fontBold,
-        color: rgb(0, 0, 0),
+        color: rgb(0, 0, 0)
       });
       y -= fontSizeTitle + 20;
 
@@ -164,6 +171,7 @@ export default async function handler(req, res) {
       const maxWidth = pageWidth - pageMargin * 2;
       const words = finalText.replace(/\r\n/g, "\n").split(/\s+/);
       let line = "";
+
       const commit = (t) => {
         if (y < pageMargin + lineHeight) {
           page = pdfDoc.addPage([pageWidth, pageHeight]);
@@ -172,6 +180,7 @@ export default async function handler(req, res) {
         page.drawText(t, { x: pageMargin, y, size: fontSizeBody, font, color: rgb(0, 0, 0) });
         y -= lineHeight;
       };
+
       for (const w of words) {
         const test = line ? line + " " + w : w;
         if (font.widthOfTextAtSize(test, fontSizeBody) > maxWidth) {
@@ -194,14 +203,14 @@ export default async function handler(req, res) {
       console.error("[PDF_ERROR]", err);
       return error(res, 500, "PDF_ERROR", "Failed to generate PDF.", {
         name: err?.name,
-        message: err?.message,
+        message: err?.message
       });
     }
   } catch (err) {
     console.error("[UNEXPECTED]", err);
     return error(res, 500, "UNEXPECTED", "Unexpected server error.", {
       name: err?.name,
-      message: err?.message,
+      message: err?.message
     });
   }
 }

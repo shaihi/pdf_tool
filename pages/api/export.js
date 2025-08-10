@@ -64,7 +64,8 @@ export default async function handler(req, res) {
       if (text.length > MAX_TEXT_LENGTH) continue;
 
       const pdfBytes = await buildStyledPdf(text, hostname);
-      const safeName = hostname.replace(/\./g, "_");
+      const timestamp = Date.now();
+      const safeName = `${hostname.replace(/\./g, "_")}_${timestamp}`;
       zip.file(`${safeName}.pdf`, pdfBytes);
     } catch (err) {
       console.error(`Error processing ${url}:`, err);
@@ -150,12 +151,13 @@ async function buildStyledPdf(chatText, sourceHost) {
   const fontSize = 12;
   const lineHeight = 16;
 
+  // Remove labels from text, keep only role info
   const messages = chatText.split(/\n\s*\n/).map(block => {
     const trimmed = block.trim();
-    if (/^system:/i.test(trimmed)) return { role: "system", text: trimmed.replace(/^system:\s*/i, "") };
-    if (/^user:/i.test(trimmed)) return { role: "user", text: trimmed.replace(/^user:\s*/i, "") };
-    if (/^assistant:/i.test(trimmed)) return { role: "assistant", text: trimmed.replace(/^assistant:\s*/i, "") };
-    return { role: "assistant", text: trimmed };
+    if (/^system:/i.test(trimmed)) return { role: "System", text: trimmed.replace(/^system:\s*/i, "") };
+    if (/^user:/i.test(trimmed)) return { role: "User", text: trimmed.replace(/^user:\s*/i, "") };
+    if (/^assistant:/i.test(trimmed)) return { role: "Assistant", text: trimmed.replace(/^assistant:\s*/i, "") };
+    return { role: "Assistant", text: trimmed };
   });
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
@@ -168,29 +170,27 @@ async function buildStyledPdf(chatText, sourceHost) {
     font: customFont,
     color: rgb(0, 0, 0)
   });
-  y -= 30;
+  y -= 24;
 
   for (const { role, text } of messages) {
-    const isUser = role === "user";
-    const isSystem = role === "system";
+    const bgColor =
+      role === "System" ? rgb(1, 1, 0.85) :
+      role === "User" ? rgb(0.8, 0.9, 1) : // light blue
+      rgb(0.85, 1, 0.85); // light green for assistant
 
-    const bgColor = isSystem ? rgb(1, 1, 0.85) : isUser ? rgb(0.2, 0.6, 0.95) : rgb(0.9, 0.9, 0.9);
-    const textColor = isUser ? rgb(1, 1, 1) : rgb(0, 0, 0);
+    const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(text);
+    const wrappedLines = wrapText(text, customFont, fontSize, pageWidth - margin * 2 - bubblePadding * 2);
 
-    const maxBubbleWidth = pageWidth * 0.65;
-    const wrappedLines = wrapText(text, customFont, fontSize, maxBubbleWidth - bubblePadding * 2);
     const bubbleHeight = wrappedLines.length * lineHeight + bubblePadding * 2;
-
     if (y - bubbleHeight < margin) {
       page = pdfDoc.addPage([pageWidth, pageHeight]);
       y = pageHeight - margin;
     }
 
-    const bubbleX = isUser ? pageWidth - margin - maxBubbleWidth : margin;
     page.drawRectangle({
-      x: bubbleX,
+      x: margin,
       y: y - bubbleHeight,
-      width: maxBubbleWidth,
+      width: pageWidth - margin * 2,
       height: bubbleHeight,
       color: bgColor,
       borderRadius: bubbleRadius
@@ -198,15 +198,14 @@ async function buildStyledPdf(chatText, sourceHost) {
 
     let textY = y - bubblePadding - fontSize;
     for (const line of wrappedLines) {
-      const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
       page.drawText(line, {
         x: isRTL
-          ? bubbleX + maxBubbleWidth - bubblePadding - customFont.widthOfTextAtSize(line, fontSize)
-          : bubbleX + bubblePadding,
+          ? pageWidth - margin - bubblePadding - customFont.widthOfTextAtSize(line, fontSize)
+          : margin + bubblePadding,
         y: textY,
         size: fontSize,
         font: customFont,
-        color: textColor
+        color: rgb(0, 0, 0)
       });
       textY -= lineHeight;
     }

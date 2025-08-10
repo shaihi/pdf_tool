@@ -8,13 +8,14 @@ import fs from "fs";
 import path from "path";
 
 // ---- Config / Security ----
-const BLOCKED_DOMAINS = ["claude.ai"]; // explicitly not allowed
+const BLOCKED_DOMAINS = []; // explicitly not allowed
 const ALLOWED_DOMAINS = [
   "chat.openai.com",
   "chatgpt.com",
   "gemini.google.com",
   "x.ai",
   "grok.com",
+  "claude.ai"
   "lechat.mistral.ai",
 ];
 const MAX_URL_LENGTH = 500;
@@ -183,28 +184,42 @@ async function scrapeChat(url, browser) {
     throw new Error(`Navigation failed (${st || "unknown"})`);
   }
 
-  // Try to dismiss banners / expand content
-  await clickByText(page, ["Accept", "I agree", "Got it", "Continue", "Show more", "Expand", "See more"]);
-  await sleep(800);
-
   const hostname = new URL(url).hostname;
-  const selectors = getSelectorsForDomain(hostname);
 
-  let extracted = await page.evaluate((sels) => {
-    const pile = [];
-    const seen = new Set();
-    const pushText = (el) => {
-      if (!el || seen.has(el)) return;
-      seen.add(el);
-      const t = el.innerText?.trim();
-      if (t) pile.push(t);
-    };
-    for (const sel of sels) {
-      document.querySelectorAll(sel).forEach(pushText);
-      if (pile.length > 0) break;
-    }
-    return pile.join("\n\n");
-  }, selectors);
+  // Try granular extraction for Gemini: each listitem is a turn
+  let extracted;
+  if (hostname.includes("gemini.google.com")) {
+    extracted = await page.evaluate(() => {
+      const items = Array.from(document.querySelectorAll('c-wiz[role="list"] [role="listitem"], [role="listitem"]'));
+      const blocks = items.map(el => el.innerText?.trim()).filter(Boolean);
+      // Fallback: whole main text
+      if (blocks.length === 0) {
+        const m = document.querySelector('main');
+        return m?.innerText?.trim() || "";
+      }
+      return blocks.join("\n\n---TURN---\n\n"); // delimiter for parse phase
+    });
+  }
+
+  if (!extracted || extracted.length < 60) {
+    // generic extraction
+    const selectors = getSelectorsForDomain(hostname);
+    extracted = await page.evaluate((sels) => {
+      const pile = [];
+      const seen = new Set();
+      const pushText = (el) => {
+        if (!el || seen.has(el)) return;
+        seen.add(el);
+        const t = el.innerText?.trim();
+        if (t) pile.push(t);
+      };
+      for (const sel of sels) {
+        document.querySelectorAll(sel).forEach(pushText);
+        if (pile.length > 0) break;
+      }
+      return pile.join("\n\n");
+    }, selectors);
+  }
 
   if (!extracted || extracted.length < 60) {
     const html = await page.content();
@@ -216,11 +231,12 @@ async function scrapeChat(url, browser) {
 }
 
 function getSelectorsForDomain(hostname) {
+  if (hostname.includes("gemini.google.com")) {
+    // prefer list items; fall back to main
+    return ['c-wiz[role="list"] [role="listitem"]', '[role="listitem"]', 'main'];
+  }
   if (hostname.includes("chatgpt") || hostname.includes("openai")) {
     return ['[data-testid="conversation-turn"]', 'article', 'main'];
-  }
-  if (hostname.includes("gemini.google.com")) {
-    return ['c-wiz[role="list"]', 'div[role="listitem"]', 'main'];
   }
   if (hostname.includes("x.ai") || hostname.includes("grok.com")) {
     return ['div[data-testid="message-bubble"]', 'main'];
@@ -228,10 +244,84 @@ function getSelectorsForDomain(hostname) {
   if (hostname.includes("lechat.mistral.ai")) {
     return ['div[class*="conversation-turn"]', 'main'];
   }
+  if (hostname.includes("claude.ai")) {
+    return ['main [data-testid="message"]', 'main article', 'main'];
+  }
   return ["body"];
 }
 
-// ---- PDF building (chat bubbles, no labels, RTL-aware) ----
+// Force proper bidi for mixed Hebrew/Latin/nums using isolates
+function shapeBidi(line) {
+  const hasRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
+  if (!hasRTL) return line;
+  // Wrap Latin/number runs with LRI/PDI, overall keep logical order
+  return line
+    .replace(/([A-Za-z0-9@.#:_/+-]+)/g, '\u2066$1\u2069') // LRI … PDI
+    .replace(/\u2066\u2069/g, ""); // clean empty
+}
+
+function parseMessages(raw, sourceHost = "") {
+  const isGemini = /gemini\.google\.com$/.test(sourceHost);
+
+  // If scraper inserted explicit turn separators for Gemini, use them
+  if (isGemini && raw.includes('---TURN---')) {
+    const parts = raw.split(/\n?\s*---TURN---\s?\n?/).map(s => s.trim()).filter(Boolean);
+    // Start with USER on Gemini; alternate
+    let role = "user";
+    return parts.map(p => {
+      const m = { role, text: p.replace(/^(You said:|User:|Assistant:|ChatGPT said:)\s*/i, "").trim() };
+      role = role === "user" ? "assistant" : "user";
+      return m;
+    });
+  }
+
+  // Generic marker-based parsing
+  const dropExact = [/^sources?$/i, /^thought for \d+s$/i];
+  const lines = String(raw).split(/\n+/).map(s => s.trim()).filter(s => s && !dropExact.some(rx => rx.test(s)));
+
+  const paragraphs = [];
+  let buf = [];
+  for (const l of lines) {
+    if (/^(You said:|Assistant:|ChatGPT said:|System:|User:)/i.test(l)) {
+      if (buf.length) { paragraphs.push(buf.join(" ").trim()); buf = []; }
+      paragraphs.push(l);
+    } else {
+      buf.push(l);
+    }
+  }
+  if (buf.length) paragraphs.push(buf.join(" ").trim());
+
+  const messages = [];
+  // Start with USER on Gemini when no clear markers; otherwise assistant
+  let currentRole = isGemini ? "user" : "assistant";
+  let currentText = [];
+
+  const flush = () => {
+    const text = currentText.join("\n").trim();
+    if (text) messages.push({ role: currentRole, text: text.replace(/^(You said:|User:|Assistant:|ChatGPT said:|System:)\s*/i, "").trim() });
+    currentText = [];
+  };
+
+  for (const p of paragraphs) {
+    const marker =
+      /^You said:/i.test(p) ? "user" :
+      /^User:/i.test(p) ? "user" :
+      /^(Assistant:|ChatGPT said:)/i.test(p) ? "assistant" :
+      /^System:/i.test(p) ? "system" : null;
+
+    if (marker) { flush(); currentRole = marker; }
+    else { currentText.push(p); }
+  }
+  flush();
+
+  if (messages.length && messages.every(m => m.role === messages[0].role)) {
+    // All same → alternate for readability
+    let r = isGemini ? "user" : "assistant";
+    for (const m of messages) { m.role = r; r = r === "user" ? "assistant" : "user"; }
+  }
+  return messages;
+}
+
 async function buildStyledPdf(chatText, sourceHost) {
   const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
   const fontBytes = fs.readFileSync(fontPath);
@@ -248,60 +338,35 @@ async function buildStyledPdf(chatText, sourceHost) {
   const fontSize = 12;
   const lineHeight = 16;
 
-  // Pass host so Gemini starts with user if no markers
   const messages = parseMessages(chatText, sourceHost);
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
   let y = pageHeight - margin;
 
-  // Title
-  page.drawText(`Chat Export - ${sourceHost}`, {
-    x: margin, y, size: 16, font, color: rgb(0, 0, 0)
-  });
+  page.drawText(`Chat Export - ${sourceHost}`, { x: margin, y, size: 16, font, color: rgb(0,0,0) });
   y -= 26;
 
   for (const m of messages) {
     const isUser = m.role === "user";
     const isSystem = m.role === "system";
-
-    // Visible colors
-    const bg = isSystem ? rgb(1.00, 0.98, 0.78)       // light yellow
-             : isUser  ? rgb(0.16, 0.45, 0.90)       // blue
-                        : rgb(0.88, 0.90, 0.96);     // gray-blue
-    const fg = isUser ? rgb(1, 1, 1) : rgb(0, 0, 0);
+    const bg = isSystem ? rgb(1.00, 0.98, 0.78) : isUser ? rgb(0.16, 0.45, 0.90) : rgb(0.88, 0.90, 0.96);
+    const fg = isUser ? rgb(1,1,1) : rgb(0,0,0);
 
     const lines = wrapText(m.text, font, fontSize, maxBubbleWidth - bubblePad * 2);
     const bubbleHeight = lines.length * lineHeight + bubblePad * 2;
+    if (y - bubbleHeight < margin) { page = pdfDoc.addPage([pageWidth, pageHeight]); y = pageHeight - margin; }
 
-    if (y - bubbleHeight < margin) {
-      page = pdfDoc.addPage([pageWidth, pageHeight]);
-      y = pageHeight - margin;
-    }
-
-    // user → right; assistant/system → left
     const rightSide = isUser;
     const bubbleX = rightSide ? pageWidth - margin - maxBubbleWidth : margin;
 
-    // Bubble
-    page.drawRectangle({
-      x: bubbleX,
-      y: y - bubbleHeight,
-      width: maxBubbleWidth,
-      height: bubbleHeight,
-      color: bg,
-      borderRadius: radius
-    });
+    page.drawRectangle({ x: bubbleX, y: y - bubbleHeight, width: maxBubbleWidth, height: bubbleHeight, color: bg, borderRadius: radius });
 
-    // Text (line-level RTL using RLE/POP; right align for user & RTL lines)
     let textY = y - bubblePad - fontSize;
     for (const rawLine of lines) {
-      const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(rawLine);
-      const visual = isRTL ? `\u202B${rawLine}\u202C` : rawLine; // force RTL when needed
-      const lineWidth = font.widthOfTextAtSize(rawLine, fontSize); // measure logical sequence
-      const tx = (isRTL || rightSide)
-        ? bubbleX + maxBubbleWidth - bubblePad - lineWidth
-        : bubbleX + bubblePad;
-      page.drawText(visual, { x: tx, y: textY, size: fontSize, font, color: fg });
+      const shaped = shapeBidi(rawLine);
+      const logicalWidth = font.widthOfTextAtSize(rawLine, fontSize);
+      const tx = rightSide ? bubbleX + maxBubbleWidth - bubblePad - logicalWidth : bubbleX + bubblePad;
+      page.drawText(shaped, { x: tx, y: textY, size: fontSize, font, color: fg });
       textY -= lineHeight;
     }
 
@@ -309,74 +374,6 @@ async function buildStyledPdf(chatText, sourceHost) {
   }
 
   return pdfDoc.save();
-}
-
-// ---- Role parsing tuned for ChatGPT + Gemini ----
-function parseMessages(raw, sourceHost = "") {
-  // Drop obvious meta-only lines
-  const dropExact = [/^sources?$/i, /^thought for \d+s$/i];
-  const dropStarts = [
-    /^community\.vercel\.com/i, /^uibakery\.io/i, /^tekpon\.com/i, /^toolsforhumans\.ai/i,
-    /^vercel\.com$/i
-  ];
-
-  const lines = String(raw)
-    .split(/\n+/)
-    .map((s) => s.trim())
-    .filter((s) => s && !dropExact.some((rx) => rx.test(s)) && !dropStarts.some((rx) => rx.test(s)));
-
-  // Keep marker paragraphs separate
-  const paragraphs = [];
-  let buf = [];
-  for (const l of lines) {
-    if (/^(You said:|Assistant:|ChatGPT said:|System:|User:)/i.test(l)) {
-      if (buf.length) { paragraphs.push(buf.join(" ").trim()); buf = []; }
-      paragraphs.push(l);
-    } else {
-      buf.push(l);
-    }
-  }
-  if (buf.length) paragraphs.push(buf.join(" ").trim());
-
-  // Build messages using markers; fallback to alternation
-  const messages = [];
-  // IMPORTANT: Gemini usually lacks explicit markers — start with USER there
-  let currentRole = /gemini\.google\.com$/.test(sourceHost) ? "user" : "assistant";
-  let currentText = [];
-
-  const flush = () => {
-    const text = currentText.join("\n").trim();
-    if (text) messages.push({ role: currentRole, text: stripLeadingLabels(text) });
-    currentText = [];
-  };
-
-  for (const p of paragraphs) {
-    const marker =
-      /^You said:/i.test(p) ? "user" :
-      /^User:/i.test(p) ? "user" :
-      /^(Assistant:|ChatGPT said:)/i.test(p) ? "assistant" :
-      /^System:/i.test(p) ? "system" : null;
-
-    if (marker) {
-      flush();
-      currentRole = marker;
-    } else {
-      currentText.push(p);
-    }
-  }
-  flush();
-
-  // Fallback: if no markers at all (common on Gemini), alternate roles
-  const hasExplicit = messages.some(m => m.role === "user" || m.role === "assistant" || m.role === "system");
-  if (!hasExplicit && messages.length > 0) {
-    let role = /gemini\.google\.com$/.test(sourceHost) ? "user" : "assistant";
-    for (const m of messages) {
-      m.role = role;
-      role = role === "assistant" ? "user" : "assistant";
-    }
-  }
-
-  return messages;
 }
 
 function stripLeadingLabels(s) {

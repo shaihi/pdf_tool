@@ -31,7 +31,6 @@ export default async function handler(req, res) {
   let { title = "Chat Export", urls = [], content = "" } = req.body || {};
   if (!Array.isArray(urls)) urls = urls ? [urls] : [];
 
-  // Title sanitization
   title = String(title).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 100) || "chat";
 
   if (urls.length === 0 && content?.trim()) {
@@ -153,10 +152,10 @@ async function buildStyledPdf(chatText, sourceHost) {
 
   const messages = chatText.split(/\n\s*\n/).map(block => {
     const trimmed = block.trim();
-    if (/^system:/i.test(trimmed)) return { role: "System", text: trimmed.replace(/^system:\s*/i, "") };
-    if (/^user:/i.test(trimmed)) return { role: "User", text: trimmed.replace(/^user:\s*/i, "") };
-    if (/^assistant:/i.test(trimmed)) return { role: "Assistant", text: trimmed.replace(/^assistant:\s*/i, "") };
-    return { role: "Assistant", text: trimmed };
+    if (/^system:/i.test(trimmed)) return { role: "system", text: trimmed.replace(/^system:\s*/i, "") };
+    if (/^user:/i.test(trimmed)) return { role: "user", text: trimmed.replace(/^user:\s*/i, "") };
+    if (/^assistant:/i.test(trimmed)) return { role: "assistant", text: trimmed.replace(/^assistant:\s*/i, "") };
+    return { role: "assistant", text: trimmed };
   });
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
@@ -169,51 +168,45 @@ async function buildStyledPdf(chatText, sourceHost) {
     font: customFont,
     color: rgb(0, 0, 0)
   });
-  y -= 24;
+  y -= 30;
 
   for (const { role, text } of messages) {
-    const bgColor =
-      role === "System" ? rgb(1, 1, 0.85) :
-      role === "User" ? rgb(0.85, 0.92, 1) :
-      rgb(0.95, 0.95, 0.95);
+    const isUser = role === "user";
+    const isSystem = role === "system";
 
-    const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(text);
-    const wrappedLines = wrapText(text, customFont, fontSize, pageWidth - margin * 2 - bubblePadding * 2);
+    const bgColor = isSystem ? rgb(1, 1, 0.85) : isUser ? rgb(0.2, 0.6, 0.95) : rgb(0.9, 0.9, 0.9);
+    const textColor = isUser ? rgb(1, 1, 1) : rgb(0, 0, 0);
 
-    const bubbleHeight = (wrappedLines.length + 1) * lineHeight + bubblePadding * 2;
+    const maxBubbleWidth = pageWidth * 0.65;
+    const wrappedLines = wrapText(text, customFont, fontSize, maxBubbleWidth - bubblePadding * 2);
+    const bubbleHeight = wrappedLines.length * lineHeight + bubblePadding * 2;
+
     if (y - bubbleHeight < margin) {
       page = pdfDoc.addPage([pageWidth, pageHeight]);
       y = pageHeight - margin;
     }
 
+    const bubbleX = isUser ? pageWidth - margin - maxBubbleWidth : margin;
     page.drawRectangle({
-      x: margin,
+      x: bubbleX,
       y: y - bubbleHeight,
-      width: pageWidth - margin * 2,
+      width: maxBubbleWidth,
       height: bubbleHeight,
       color: bgColor,
       borderRadius: bubbleRadius
     });
 
     let textY = y - bubblePadding - fontSize;
-    page.drawText(`${role}:`, {
-      x: margin + bubblePadding,
-      y: textY,
-      size: fontSize,
-      font: customFont,
-      color: rgb(0, 0, 0)
-    });
-    textY -= lineHeight;
-
     for (const line of wrappedLines) {
+      const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
       page.drawText(line, {
         x: isRTL
-          ? pageWidth - margin - bubblePadding - customFont.widthOfTextAtSize(line, fontSize)
-          : margin + bubblePadding,
+          ? bubbleX + maxBubbleWidth - bubblePadding - customFont.widthOfTextAtSize(line, fontSize)
+          : bubbleX + bubblePadding,
         y: textY,
         size: fontSize,
         font: customFont,
-        color: rgb(0, 0, 0)
+        color: textColor
       });
       textY -= lineHeight;
     }

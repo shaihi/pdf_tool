@@ -1,3 +1,4 @@
+// pages/api/export.js
 import { PDFDocument, rgb } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import { htmlToText } from "html-to-text";
@@ -6,37 +7,110 @@ import JSZip from "jszip";
 import fs from "fs";
 import path from "path";
 
+// ---- Config / Security ----
 const ALLOWED_DOMAINS = [
   "chat.openai.com",
   "chatgpt.com",
   "gemini.google.com",
   "x.ai",
   "grok.com",
-  "lechat.mistral.ai"
+  "lechat.mistral.ai",
 ];
-
 const MAX_URL_LENGTH = 500;
-const MAX_TEXT_LENGTH = 50000;
+const MAX_TEXT_LENGTH = 120_000;
 
 function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- Handler ----
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", ["POST"]);
     return error(res, 405, "METHOD_NOT_ALLOWED", "Use POST /api/export");
   }
 
-  let { title = "Chat Export", urls = [], content = "" } = req.body || {};
-  if (!Array.isArray(urls)) urls = urls ? [urls] : [];
-
-  title = String(title).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 100) || "chat";
-
-  if (urls.length === 0 && content?.trim()) {
-    return renderSinglePdf(content.trim(), title, res);
+  // Accept { urls: [] }, or legacy { url: "a\nb" }
+  let { title = "Chat Export", urls = [], url = "", content = "" } = req.body || {};
+  if (!Array.isArray(urls)) urls = typeof urls === "string" ? urls.split(/\s+/).filter(Boolean) : [];
+  if (urls.length === 0 && typeof url === "string" && url.trim()) {
+    urls = url.split(/\s+/).map((u) => u.trim()).filter(Boolean);
   }
 
+  // Title sanitize
+  title = String(title).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 100) || "chat";
+
+  // Content-only single PDF
+  if (urls.length === 0 && content?.trim()) {
+    try {
+      const pdfBytes = await buildStyledPdf(content.trim(), "custom-content");
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${title}_${Date.now()}.pdf"`);
+      return res.status(200).send(Buffer.from(pdfBytes));
+    } catch (e) {
+      return error(res, 500, "PDF_ERROR", "Failed to generate PDF.", { message: e?.message });
+    }
+  }
+
+  if (urls.length === 0) {
+    return error(res, 400, "INVALID_INPUT", "Provide at least one chat URL or some chat text.");
+  }
+
+  // Validate URLs & domains early
+  const cleaned = [];
+  for (const raw of urls) {
+    if (typeof raw !== "string" || !raw.trim() || raw.length > MAX_URL_LENGTH) continue;
+    try {
+      const u = new URL(raw);
+      if (!ALLOWED_DOMAINS.some((d) => u.hostname.endsWith(d))) continue;
+      cleaned.push(u);
+    } catch {
+      // skip invalid
+    }
+  }
+  if (cleaned.length === 0) {
+    return error(res, 400, "NO_ALLOWED_URLS", "No URLs with allowed domains were provided.");
+  }
+
+  // Single URL → return a single PDF (used by “Download PDF” per row)
+  if (cleaned.length === 1) {
+    const u = cleaned[0];
+    const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
+    if (!BROWSERLESS_WS_URL) {
+      return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
+    }
+
+    let browser;
+    try {
+      browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
+      const text = await scrapeChat(u.toString(), browser);
+      if (!text || text.length < 60 || text.length > MAX_TEXT_LENGTH) {
+        await safeDisconnect(browser);
+        return error(res, 422, "EXTRACT_EMPTY", "Could not extract enough text.", {
+          url: u.toString(),
+          length: text?.length || 0,
+        });
+      }
+      const pdfBytes = await buildStyledPdf(text, u.hostname);
+      await safeDisconnect(browser);
+
+      const safeBase = u.hostname.replace(/\./g, "_");
+      const unique = Date.now();
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeBase}_${unique}.pdf"`);
+      return res.status(200).send(Buffer.from(pdfBytes));
+    } catch (e) {
+      await safeDisconnect(browser);
+      return error(res, 422, "SINGLE_URL_ERROR", "Failed to export this URL.", {
+        url: u.toString(),
+        message: e?.message,
+      });
+    }
+  }
+
+  // Multi URL → build a ZIP
   const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
   if (!BROWSERLESS_WS_URL) {
     return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
@@ -52,23 +126,20 @@ export default async function handler(req, res) {
   }
 
   const zip = new JSZip();
+  let index = 0;
 
-  for (const url of urls) {
-    if (typeof url !== "string" || url.length > MAX_URL_LENGTH) continue;
-    let hostname;
-    try { hostname = new URL(url).hostname; } catch { continue; }
-    if (!ALLOWED_DOMAINS.some(d => hostname.endsWith(d))) continue;
-
+  for (const u of cleaned) {
     try {
-      const text = await scrapeChat(url, browser);
-      if (text.length > MAX_TEXT_LENGTH) continue;
+      const text = await scrapeChat(u.toString(), browser);
+      if (!text || text.length < 60 || text.length > MAX_TEXT_LENGTH) continue;
 
-      const pdfBytes = await buildStyledPdf(text, hostname);
-      const timestamp = Date.now();
-      const safeName = `${hostname.replace(/\./g, "_")}_${timestamp}`;
-      zip.file(`${safeName}.pdf`, pdfBytes);
-    } catch (err) {
-      console.error(`Error processing ${url}:`, err);
+      const pdfBytes = await buildStyledPdf(text, u.hostname);
+      const base = u.hostname.replace(/\./g, "_");
+      const unique = `${Date.now()}_${index++}`;
+      zip.file(`${base}_${unique}.pdf`, pdfBytes);
+    } catch (e) {
+      // skip this URL but continue others
+      console.error("Export error:", u.toString(), e?.message || e);
     }
   }
 
@@ -84,12 +155,27 @@ export default async function handler(req, res) {
   return res.status(200).send(zipBytes);
 }
 
+// ---- Scraping ----
 async function scrapeChat(url, browser) {
   const page = await browser.newPage();
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   );
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "en-US,en;q=0.9",
+    Referer: new URL(url).origin + "/",
+  });
+
+  const resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 }).catch((e) => e);
+  if (!resp || (typeof resp.status === "function" && resp.status() >= 400)) {
+    const st = typeof resp?.status === "function" ? resp.status() : 0;
+    await page.close();
+    throw new Error(`Navigation failed (${st || "unknown"})`);
+  }
+
+  // Try to dismiss banners / expand content
+  await clickByText(page, ["Accept", "I agree", "Got it", "Continue", "Show more", "Expand", "See more"]);
+  await sleep(800);
 
   const hostname = new URL(url).hostname;
   const selectors = getSelectorsForDomain(hostname);
@@ -121,20 +207,21 @@ async function scrapeChat(url, browser) {
 
 function getSelectorsForDomain(hostname) {
   if (hostname.includes("chatgpt") || hostname.includes("openai")) {
-    return ['[data-testid="conversation-turn"]', 'article'];
+    return ['[data-testid="conversation-turn"]', 'article', 'main'];
   }
   if (hostname.includes("gemini.google.com")) {
-    return ['c-wiz[role="list"]', 'div[role="listitem"]'];
+    return ['c-wiz[role="list"]', 'div[role="listitem"]', 'main'];
   }
   if (hostname.includes("x.ai") || hostname.includes("grok.com")) {
-    return ['div[data-testid="message-bubble"]'];
+    return ['div[data-testid="message-bubble"]', 'main'];
   }
   if (hostname.includes("lechat.mistral.ai")) {
-    return ['div[class*="conversation-turn"]'];
+    return ['div[class*="conversation-turn"]', 'main'];
   }
   return ["body"];
 }
 
+// ---- PDF building (chat bubbles, no labels, RTL-aware) ----
 async function buildStyledPdf(chatText, sourceHost) {
   const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
   const fontBytes = fs.readFileSync(fontPath);
@@ -151,7 +238,6 @@ async function buildStyledPdf(chatText, sourceHost) {
   const fontSize = 12;
   const lineHeight = 16;
 
-  // NEW: structured messages
   const messages = parseMessages(chatText);
 
   let page = pdfDoc.addPage([pageWidth, pageHeight]);
@@ -194,7 +280,7 @@ async function buildStyledPdf(chatText, sourceHost) {
       borderRadius: radius
     });
 
-    // Text (line-level RTL)
+    // Text (line-level RTL awareness + right alignment for user)
     let textY = y - bubblePad - fontSize;
     for (const line of lines) {
       const isRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
@@ -212,13 +298,12 @@ async function buildStyledPdf(chatText, sourceHost) {
   return pdfDoc.save();
 }
 
-// NEW: parses your exported text into {role, text}[]
+// ---- Role parsing tuned for your exports ----
 function parseMessages(raw) {
-  // Remove obvious meta-only lines
+  // Drop obvious meta-only lines
   const dropExact = [
-    /^sources$/i,
-    /^source$/i,
-    /^thought for \d+s$/i
+    /^sources?$/i,
+    /^thought for \d+s$/i,
   ];
   const dropStarts = [
     /^community\.vercel\.com/i, /^uibakery\.io/i, /^tekpon\.com/i, /^toolsforhumans\.ai/i,
@@ -227,14 +312,14 @@ function parseMessages(raw) {
 
   const lines = String(raw)
     .split(/\n+/)
-    .map(s => s.trim())
-    .filter(s => s && !dropExact.some(rx => rx.test(s)) && !dropStarts.some(rx => rx.test(s)));
+    .map((s) => s.trim())
+    .filter((s) => s && !dropExact.some((rx) => rx.test(s)) && !dropStarts.some((rx) => rx.test(s)));
 
-  // Collapse to paragraphs
+  // Collapse to paragraphs with markers separated
   const paragraphs = [];
   let buf = [];
   for (const l of lines) {
-    if (/^(You said:|Assistant:|ChatGPT said:|System:|User:|Assistant)/i.test(l)) {
+    if (/^(You said:|Assistant:|ChatGPT said:|System:|User:)/i.test(l)) {
       if (buf.length) { paragraphs.push(buf.join(" ").trim()); buf = []; }
       paragraphs.push(l); // keep marker as its own paragraph
     } else {
@@ -245,7 +330,7 @@ function parseMessages(raw) {
 
   // Build messages using markers, with alternation fallback
   const messages = [];
-  let currentRole = "assistant"; // start from assistant by default for shared pages
+  let currentRole = "assistant"; // defaults for shared pages
   let currentText = [];
 
   const flush = () => {
@@ -258,25 +343,25 @@ function parseMessages(raw) {
     const marker =
       /^You said:/i.test(p) ? "user" :
       /^User:/i.test(p) ? "user" :
-      /^Assistant:|^ChatGPT said:/i.test(p) ? "assistant" :
+      /^(Assistant:|ChatGPT said:)/i.test(p) ? "assistant" :
       /^System:/i.test(p) ? "system" : null;
 
     if (marker) {
       flush();
       currentRole = marker;
     } else {
-      // No explicit marker → append to current block
       currentText.push(p);
     }
   }
   flush();
 
-  // If everything ended up in one role, do a gentle alternation pass to improve readability
-  const uniqueRoles = new Set(messages.map(m => m.role));
+  // If everything is one role, alternate to improve readability
+  const uniqueRoles = new Set(messages.map((m) => m.role));
   if (uniqueRoles.size === 1 && messages.length > 1) {
     let alt = "assistant";
     for (const m of messages) {
-      m.role = alt = (alt === "assistant" ? "user" : "assistant");
+      alt = alt === "assistant" ? "user" : "assistant";
+      m.role = alt;
     }
   }
 
@@ -293,32 +378,37 @@ function stripLeadingLabels(s) {
     .trim();
 }
 
+// ---- Helpers ----
 function wrapText(text, font, fontSize, maxWidth) {
-  const words = text.split(/\s+/);
-  let lines = [];
-  let currentLine = "";
-
-  for (const word of words) {
-    const testLine = currentLine ? currentLine + " " + word : word;
-    const testWidth = font.widthOfTextAtSize(testLine, fontSize);
-    if (testWidth > maxWidth && currentLine) {
-      lines.push(currentLine);
-      currentLine = word;
+  const words = String(text).split(/\s+/);
+  let lines = [], line = "";
+  for (const w of words) {
+    const test = line ? line + " " + w : w;
+    if (font.widthOfTextAtSize(test, fontSize) > maxWidth && line) {
+      lines.push(line);
+      line = w;
     } else {
-      currentLine = testLine;
+      line = test;
     }
   }
-  if (currentLine) lines.push(currentLine);
+  if (line) lines.push(line);
   return lines;
-}
-
-async function renderSinglePdf(content, title, res) {
-  const pdfBytes = await buildStyledPdf(content, "custom-content");
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${title}.pdf"`);
-  return res.status(200).send(Buffer.from(pdfBytes));
 }
 
 async function safeDisconnect(browser) {
   try { await browser.disconnect(); } catch {}
+}
+
+async function clickByText(page, labels) {
+  try {
+    await page.evaluate((texts) => {
+      const tryClick = (t) => {
+        const xp = `//button[normalize-space(text())='${t}'] | //*[self::button or self::a or self::div][contains(@role,'button')][normalize-space(text())='${t}']`;
+        const r = document.evaluate(xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        if (r.snapshotLength > 0) { (r.snapshotItem(0)).click(); return true; }
+        return false;
+      };
+      for (const t of texts) if (tryClick(t)) break;
+    }, labels);
+  } catch {}
 }

@@ -1,4 +1,3 @@
-// pages/api/export.js
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { htmlToText } from "html-to-text";
 import chromium from "@sparticuz/chromium";
@@ -15,33 +14,41 @@ export default async function handler(req, res) {
   }
 
   const { title = "Chat Export", content = "", url = "" } = req.body || {};
-  let finalText = "";
 
   // If raw text provided, skip browser
   if (!url || !/^https?:\/\//i.test(url)) {
     if (!content?.trim()) {
       return error(res, 400, "INVALID_INPUT", "Provide chat text or a share URL.");
     }
-    finalText = String(content).trim();
-    return renderPdf(finalText, title, res);
+    return renderPdf(content.trim(), title, res);
   }
 
   // Validate URL
   try { new URL(url); } catch { return error(res, 400, "INVALID_URL", "Invalid URL.", { url }); }
 
-  // ---- Headless browser path ----
+  // Try hosted browser first (Browserless). Set BROWSERLESS_WS_URL in Vercel env.
+  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
+
   let browser;
   try {
-    const executablePath = await chromium.executablePath();
-    browser = await puppeteer.launch({
-      args: chromium.args,
-      defaultViewport: chromium.defaultViewport,
-      executablePath,
-      headless: chromium.headless,
-      ignoreHTTPSErrors: true,
-    });
+    if (BROWSERLESS_WS_URL) {
+      // Connect to hosted Chrome (no local binary; avoids libnss issues)
+      browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
+    } else {
+      // Fallback: launch Sparticuz Chromium in-serverless
+      const executablePath = await chromium.executablePath();
+      browser = await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath,
+        headless: chromium.headless,
+        ignoreHTTPSErrors: true
+      });
+    }
   } catch (e) {
-    return error(res, 502, "BROWSER_LAUNCH_FAILED", "Failed to start headless browser.", { name: e?.name, message: e?.message });
+    return error(res, 502, "BROWSER_LAUNCH_FAILED", "Failed to start headless browser.", {
+      name: e?.name, message: e?.message, usingHosted: Boolean(BROWSERLESS_WS_URL)
+    });
   }
 
   try {
@@ -51,57 +58,42 @@ export default async function handler(req, res) {
     );
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-    // Go to the share URL
     const resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 }).catch((e) => e);
     if (!resp || (typeof resp.status === "function" && resp.status() >= 400)) {
       const status = typeof resp?.status === "function" ? resp.status() : 0;
-      await browser.close();
+      await safeClose(browser, BROWSERLESS_WS_URL);
       return error(res, 400, "NAVIGATION_FAILED_STATUS", `Navigation failed with status ${status || "unknown"}.`, { url, status });
     }
 
-    // Dismiss common banners/dialogs (best-effort; ignore failures)
+    // Best-effort: dismiss banners
     await safeClickByText(page, ["Accept", "I agree", "Got it", "Continue"]);
     await page.waitForTimeout(800);
 
-    // Wait for likely chat containers (best guesses for share pages)
+    // Wait for likely chat nodes
     const candidateSelectors = [
-      '[data-message-author]',
-      '[data-message-id]',
-      '[data-testid="conversation-turn"]',
-      'article',
-      'main [class*="conversation"]',
-      'main',
-      '#__next'
+      '[data-message-author]', '[data-message-id]', '[data-testid="conversation-turn"]',
+      'article', 'main [class*="conversation"]', 'main', '#__next'
     ];
+    try { await page.waitForSelector(candidateSelectors.join(","), { timeout: 8000 }); } catch {}
 
-    let extracted = "";
-    // Try: wait for any candidate to appear
-    try {
-      await page.waitForSelector(candidateSelectors.join(","), { timeout: 8000 });
-    } catch { /* keep going; we’ll still try to read */ }
-
-    // Give SPA time to hydrate
     await page.waitForTimeout(1200);
-
-    // Try to click “Show more/Expand” buttons if present
     await safeClickByText(page, ["Show more", "Expand", "See more"]);
     await page.waitForTimeout(500);
 
-    // Extract innerText from most specific to broad
-    extracted = await page.evaluate((sels) => {
+    // Extract
+    let extracted = await page.evaluate((sels) => {
       const pile = [];
       const seen = new Set();
       const pushText = (el) => {
         if (!el || seen.has(el)) return;
         seen.add(el);
         const t = el.innerText?.trim();
-        if (t && t.length) pile.push(t);
+        if (t) pile.push(t);
       };
       for (const sel of sels) {
         document.querySelectorAll(sel).forEach(pushText);
         if (pile.length > 0 && (sel.includes("[data-") || sel === "article")) break;
       }
-      // Fallback to body if still empty
       if (pile.length === 0) {
         const t = document.body?.innerText?.trim();
         if (t) pile.push(t);
@@ -109,27 +101,24 @@ export default async function handler(req, res) {
       return pile.join("\n\n");
     }, candidateSelectors);
 
-    // If still too short, fallback to rendered HTML → text
     if (!extracted || extracted.length < 60) {
       const html = await page.content();
       try {
         extracted = htmlToText(html, {
           selectors: [
             { selector: "script", format: "skip" },
-            { selector: "style", format: "skip" },
-            { selector: "nav", format: "skip" },
+            { selector: "style",  format: "skip" },
+            { selector: "nav",    format: "skip" },
             { selector: "footer", format: "skip" },
             { selector: "header", format: "skip" }
           ],
           baseElements: { selectors: ["main", "#__next", "body"] },
           wordwrap: false
         }).trim();
-      } catch (e) {
-        // keep extracted as-is
-      }
+      } catch {}
     }
 
-    await browser.close();
+    await safeClose(browser, BROWSERLESS_WS_URL);
 
     if (!extracted || extracted.length < 60) {
       return error(res, 422, "EXTRACT_EMPTY", "Fetched the page but could not find readable chat text.", {
@@ -137,12 +126,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // Light normalization
-    finalText = extracted.replace(/\n{3,}/g, "\n\n").trim();
-
+    const finalText = extracted.replace(/\n{3,}/g, "\n\n").trim();
     return renderPdf(finalText, title, res);
   } catch (e) {
-    try { if (browser) await browser.close(); } catch {}
+    await safeClose(browser, BROWSERLESS_WS_URL);
     return error(res, 422, "EXTRACT_ERROR", "Failed to extract text from the page.", {
       url, name: e?.name, message: e?.message
     });
@@ -161,7 +148,11 @@ async function safeClickByText(page, labels) {
       };
       for (const t of texts) if (findBtn(t)) break;
     }, labels);
-  } catch { /* ignore */ }
+  } catch {}
+}
+
+async function safeClose(browser, isRemote) {
+  try { isRemote ? await browser.disconnect() : await browser.close(); } catch {}
 }
 
 async function renderPdf(finalText, title, res) {

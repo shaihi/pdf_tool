@@ -75,3 +75,19 @@ console.log(data);
 
 ## Tuning
 - Adjust `threshold` and `KEYWORD_PATTERNS` in `lib/challenge.js` to fit your data.
+
+# Challenge UI Page
+
+Adds `/challenge` page to paste a chat and run `/api/analyze`. Also lets a user save their own OpenAI API key (encrypted) in Vercel KV for their session.
+
+## Files
+- `pages/challenge.js`
+- `pages/api/user-key.js`
+- `lib/session.js`
+- `lib/kv.js`
+
+## Setup
+1) `npm i @vercel/kv`
+2) In Vercel env vars, set: `KV_URL`, `KV_REST_API_URL`, `KV_REST_API_TOKEN`, and `USER_KEY_SECRET` (>=16 chars).
+3) Deploy, then visit `/challenge`.
+

@@ -6,7 +6,7 @@ import path from "path";
 export default async function handler(req, res) {
   try {
     // Load font file from /public/fonts
-    const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
+    const fontPath = path.join(process.cwd(), "public", "../../lib/fonts", "DejaVuSans.ttf");
     if (!fs.existsSync(fontPath)) {
       return res.status(500).json({
         ok: false,

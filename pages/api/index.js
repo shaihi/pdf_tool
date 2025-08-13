@@ -1,9 +1,9 @@
 // Auto-generated barrel re-export file
-export * from "./pdf_core.js";
-export * from "./html_render.js";
-export * from "./fonts.js";
-export * from "./utils.js";
-export * from "./api_handler.js";
-export * from "./validation.js";
-export * from "./file_io.js";
-export * from "./other.js";
+export * from "../../lib/pdf_core";
+export * from "../../lib/html_render";
+export * from "../../lib/fonts";
+export * from "../../lib/utils";
+export * from "../../lib/api_handler";
+export * from "../../lib/validation";
+export * from "../../lib/file_io";
+export * from "../../lib/other";

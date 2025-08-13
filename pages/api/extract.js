@@ -7,6 +7,7 @@ const ALLOWED_DOMAINS = [
   "chat.openai.com",
   "chatgpt.com",
   "gemini.google.com",
+  "https://g.co/gemini/share/",
   "x.ai",
   "grok.com",
   "claude.ai",

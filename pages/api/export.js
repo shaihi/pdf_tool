@@ -1,33 +1,54 @@
-// pages/api/export.js
-import { PDFDocument, rgb } from "pdf-lib";
-import fontkit from "@pdf-lib/fontkit";
-import { htmlToText } from "html-to-text";
+// pages/api/extract.js
 import puppeteer from "puppeteer-core";
-import JSZip from "jszip";
-import fs from "fs";
-import path from "path";
+import { htmlToText } from "html-to-text";
 
 // ---- Config / Security ----
-const BLOCKED_DOMAINS = []; // none blocked now
-const ALLOWED_DOMAINS = [
+// IMPORTANT: hostnames only (no protocol, no path)
+const ALLOWED_HOSTS = [
   "chat.openai.com",
   "chatgpt.com",
   "gemini.google.com",
+  "g.co",                 // allowed only for /gemini/share/* short-links (see validation below)
   "x.ai",
   "grok.com",
   "claude.ai",
   "lechat.mistral.ai",
 ];
+
 const MAX_URL_LENGTH = 500;
 const MAX_TEXT_LENGTH = 120_000;
 
 function error(res, status, code, message, details = {}) {
   return res.status(status).json({ ok: false, code, message, details });
 }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// NEW: preflight public-access checker (detects login redirects / 4xx/5xx)
-// replace checkPublicAccess with this
+// ---------- Redirect resolver (expands short-links like g.co/gemini/share/*) ----------
+async function resolveShareUrl(inputUrl, maxHops = 5) {
+  let current = inputUrl;
+  for (let i = 0; i < maxHops; i++) {
+    const r = await fetch(current, { method: "GET", redirect: "manual" });
+    const status = r.status;
+    const loc = r.headers.get("location");
+
+    // 2xx → stop (final)
+    if (status >= 200 && status < 300) return { url: current, hops: i, final: true };
+
+    // 3xx with location → follow
+    if (status >= 300 && status < 400 && loc) {
+      const base = new URL(current);
+      const next = new URL(loc, base);
+      current = next.toString();
+      continue;
+    }
+
+    // Anything else → stop with partial
+    return { url: current, hops: i, final: false, status, location: loc || "" };
+  }
+  // Max hops reached: return last seen
+  return { url: current, hops: maxHops, final: false, status: 310, location: "" };
+}
+
+// ---------- Public-access preflight (relaxed for same-host redirects) ----------
 async function checkPublicAccess(u) {
   try {
     const r = await fetch(u, { method: "GET", redirect: "manual" });
@@ -37,12 +58,9 @@ async function checkPublicAccess(u) {
     const redir = loc ? new URL(loc, target.origin) : null;
 
     const toLogin =
-      (redir && /login|signin|auth|session/i.test(redir.pathname + redir.search)) ||
+      (redir && /login|signin|auth|session/i.test((redir.pathname || "") + (redir.search || ""))) ||
       (redir && /accounts\.google\.com|auth|login/i.test(redir.hostname));
 
-    // OK if:
-    // - 200, OR
-    // - 3xx redirect that stays within claude.ai (or same host) AND not to a login/auth path
     const sameHost = redir && (redir.hostname === target.hostname);
     const isPublic =
       (status >= 200 && status < 300) ||
@@ -63,156 +81,7 @@ async function checkPublicAccess(u) {
   }
 }
 
-// ---- Handler ----
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
-    return error(res, 405, "METHOD_NOT_ALLOWED", "Use POST /api/export");
-  }
-
-  let { title = "Chat Export", urls = [], url = "", content = "" } = req.body || {};
-  if (!Array.isArray(urls)) urls = typeof urls === "string" ? urls.split(/\s+/).filter(Boolean) : [];
-  if (urls.length === 0 && typeof url === "string" && url.trim()) {
-    urls = url.split(/\s+/).map((u) => u.trim()).filter(Boolean);
-  }
-
-  // Title sanitize
-  title = String(title).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 100) || "chat";
-
-  // Content-only single PDF
-  if (urls.length === 0 && content?.trim()) {
-    try {
-      const pdfBytes = await buildStyledPdf(content.trim(), "custom-content");
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `attachment; filename="${title}_${Date.now()}.pdf"`);
-      return res.status(200).send(Buffer.from(pdfBytes));
-    } catch (e) {
-      return error(res, 500, "PDF_ERROR", "Failed to generate PDF.", { message: e?.message });
-    }
-  }
-
-  if (urls.length === 0) {
-    return error(res, 400, "INVALID_INPUT", "Provide at least one chat URL or some chat text.");
-  }
-
-  // Validate URLs & domains
-  const cleaned = [];
-  for (const raw of urls) {
-    if (typeof raw !== "string" || !raw.trim() || raw.length > MAX_URL_LENGTH) continue;
-    let u;
-    try { u = new URL(raw); } catch { continue; }
-    const host = u.hostname.toLowerCase();
-
-    if (BLOCKED_DOMAINS.some((d) => host.endsWith(d))) {
-      return error(res, 400, "DOMAIN_BLOCKED", "This domain is not supported.", { url: raw, domain: host });
-    }
-    if (!ALLOWED_DOMAINS.some((d) => host.endsWith(d))) continue;
-    cleaned.push(u);
-  }
-  if (cleaned.length === 0) {
-    return error(res, 400, "NO_ALLOWED_URLS", "No URLs with allowed domains were provided.");
-  }
-
-  // Single URL → return a single PDF (per-row Download PDF)
-  if (cleaned.length === 1) {
-    const u = cleaned[0];
-
-    // NEW: preflight public access (helps with Claude private shares)
-    const pre = await checkPublicAccess(u.toString());
-    if (!pre.ok) {
-      return error(
-        res,
-        422,
-        "PRIVATE_SHARE",
-        pre.message,
-        { url: u.toString(), status: pre.status, location: pre.location }
-      );
-    }
-
-    const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
-    if (!BROWSERLESS_WS_URL) {
-      return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
-    }
-
-    let browser;
-    try {
-      browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
-      const text = await scrapeChat(u.toString(), browser);
-      if (!text || text.length < 60 || text.length > MAX_TEXT_LENGTH) {
-        await safeDisconnect(browser);
-        return error(res, 422, "EXTRACT_EMPTY", "Could not extract enough text.", {
-          url: u.toString(),
-          length: text?.length || 0,
-        });
-      }
-      const pdfBytes = await buildStyledPdf(text, u.hostname);
-      await safeDisconnect(browser);
-
-      const base = u.hostname.replace(/\./g, "_");
-      const unique = Date.now();
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `attachment; filename="${base}_${unique}.pdf"`);
-      return res.status(200).send(Buffer.from(pdfBytes));
-    } catch (e) {
-      await safeDisconnect(browser);
-      return error(res, 422, "SINGLE_URL_ERROR", "Failed to export this URL.", {
-        url: u.toString(),
-        message: e?.message,
-      });
-    }
-  }
-
-  // Multi URL → build a ZIP
-  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
-  if (!BROWSERLESS_WS_URL) {
-    return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
-  }
-
-  let browser;
-  try {
-    browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
-  } catch (e) {
-    return error(res, 502, "BROWSER_CONNECT_FAILED", "Could not connect to Browserless.", {
-      name: e?.name, message: e?.message
-    });
-  }
-
-  const zip = new JSZip();
-  let index = 0;
-
-  for (const u of cleaned) {
-    try {
-      const pre = await checkPublicAccess(u.toString());
-      if (!pre.ok) {
-        console.warn("Skipping private/blocked:", u.toString(), pre.status, pre.location);
-        continue;
-      }
-
-      const text = await scrapeChat(u.toString(), browser);
-      if (!text || text.length < 60 || text.length > MAX_TEXT_LENGTH) continue;
-
-      const pdfBytes = await buildStyledPdf(text, u.hostname);
-      const base = u.hostname.replace(/\./g, "_");
-      const unique = `${Date.now()}_${index++}`;
-      zip.file(`${base}_${unique}.pdf`, pdfBytes);
-    } catch (e) {
-      console.error("Export error:", u.toString(), e?.message || e);
-    }
-  }
-
-  await safeDisconnect(browser);
-
-  if (Object.keys(zip.files).length === 0) {
-    return error(res, 422, "NO_VALID_PDFS", "No valid PDFs could be generated.");
-  }
-
-  const zipBytes = await zip.generateAsync({ type: "nodebuffer" });
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", `attachment; filename="${title}.zip"`);
-  return res.status(200).send(zipBytes);
-}
-
-// ---- Scraping ----
+// ---------- Scraping ----------
 async function scrapeChat(url, browser) {
   const page = await browser.newPage();
   await page.setUserAgent(
@@ -233,7 +102,7 @@ async function scrapeChat(url, browser) {
 
   const hostname = new URL(url).hostname;
 
-  // Prefer granular extraction for Gemini: each listitem is a turn
+  // Gemini: try granular turns first
   let extracted;
   if (hostname.includes("gemini.google.com")) {
     extracted = await page.evaluate(() => {
@@ -271,7 +140,7 @@ async function scrapeChat(url, browser) {
 
   await page.close();
 
-  // Remove Gemini header noise so first "turn" is the user question
+  // Trim Gemini header noise
   if (hostname.includes("gemini.google.com")) {
     extracted = stripGeminiHeader(extracted);
   }
@@ -298,7 +167,6 @@ function getSelectorsForDomain(hostname) {
   return ["body"];
 }
 
-// Strip Gemini page header block
 function stripGeminiHeader(s) {
   const lines = s.split(/\n+/);
   const cleaned = [];
@@ -321,30 +189,33 @@ function stripGeminiHeader(s) {
   return cleaned.join("\n");
 }
 
-// Force proper bidi for mixed Hebrew/Latin/nums using isolates
-function shapeBidi(line) {
-  const hasRTL = /[\u0590-\u05FF\u0600-\u06FF]/.test(line);
-  if (!hasRTL) return line;
-  return line
-    .replace(/([A-Za-z0-9@.#:_/+-]+)/g, '\u2066$1\u2069') // LRI … PDI around Latin/nums
-    .replace(/\u2066\u2069/g, ""); // clean empties
+// ---------- Parsing (roles) ----------
+function stripLeadingLabels(s) {
+  return s
+    .replace(/^You said:\s*/i, "")
+    .replace(/^User:\s*/i, "")
+    .replace(/^Assistant:\s*/i, "")
+    .replace(/^ChatGPT said:\s*/i, "")
+    .replace(/^System:\s*/i, "")
+    .trim();
 }
 
-// Role parsing (ChatGPT markers + Gemini fallbacks)
 function parseMessages(raw, sourceHost = "") {
   const isGemini = /gemini\.google\.com$/.test(sourceHost);
 
+  // If explicit Gemini separators exist, alternate starting with user
   if (isGemini && raw.includes('---TURN---')) {
     const parts = raw.split(/\n?\s*---TURN---\s?\n?/).map(s => s.trim()).filter(Boolean);
     let role = "user";
     return parts.map(p => {
-      const text = p.replace(/^(You said:|User:|Assistant:|ChatGPT said:|System:)\s*/i, "").trim();
+      const text = stripLeadingLabels(p);
       const m = { role, text };
       role = role === "user" ? "assistant" : "user";
       return m;
     });
   }
 
+  // Generic marker-based parsing (ChatGPT etc.)
   const dropExact = [/^sources?$/i, /^thought for \d+s$/i];
   const dropStarts = [
     /^community\.vercel\.com/i, /^uibakery\.io/i, /^tekpon\.com/i, /^toolsforhumans\.ai/i, /^vercel\.com$/i,
@@ -369,7 +240,7 @@ function parseMessages(raw, sourceHost = "") {
   if (buf.length) paragraphs.push(buf.join(" ").trim());
 
   const messages = [];
-  let currentRole = isGemini ? "assistant" : "assistant";
+  let currentRole = "assistant";
   let currentText = [];
 
   const flush = () => {
@@ -390,13 +261,10 @@ function parseMessages(raw, sourceHost = "") {
   }
   flush();
 
-  // Strong Gemini fallback: no markers or one speaker → alternate by paragraph starting with USER
+  // Strong Gemini fallback: alternate by paragraph if only one speaker detected
   const onlyOneSpeaker = messages.length <= 1 || messages.every(m => m.role === messages[0].role);
   if (isGemini && onlyOneSpeaker) {
-    const paras = String(raw)
-      .split(/\n{2,}/)
-      .map(s => s.trim())
-      .filter(Boolean);
+    const paras = String(raw).split(/\n{2,}/).map(s => s.trim()).filter(Boolean);
     let role = "user";
     const alt = paras.map(p => {
       const m = { role, text: stripLeadingLabels(p) };
@@ -410,104 +278,113 @@ function parseMessages(raw, sourceHost = "") {
   return messages;
 }
 
-function stripLeadingLabels(s) {
-  return s
-    .replace(/^You said:\s*/i, "")
-    .replace(/^User:\s*/i, "")
-    .replace(/^Assistant:\s*/i, "")
-    .replace(/^ChatGPT said:\s*/i, "")
-    .replace(/^System:\s*/i, "")
-    .trim();
-}
-
-// ---- PDF building (chat bubbles, no labels, RTL-aware) ----
-async function buildStyledPdf(chatText, sourceHost) {
-  const fontPath = path.join(process.cwd(), "public", "fonts", "DejaVuSans.ttf");
-  const fontBytes = fs.readFileSync(fontPath);
-
-  const pdfDoc = await PDFDocument.create();
-  pdfDoc.registerFontkit(fontkit);
-  const font = await pdfDoc.embedFont(fontBytes);
-
-  const pageWidth = 595.28, pageHeight = 841.89;
-  const margin = 36;
-  const maxBubbleWidth = Math.floor((pageWidth - margin * 2) * 0.70);
-  const bubblePad = 10;
-  const radius = 10;
-  const fontSize = 12;
-  const lineHeight = 16;
-
-  const messages = parseMessages(chatText, sourceHost);
-
-  let page = pdfDoc.addPage([pageWidth, pageHeight]);
-  let y = pageHeight - margin;
-
-  page.drawText(`Chat Export - ${sourceHost}`, { x: margin, y, size: 16, font, color: rgb(0,0,0) });
-  y -= 26;
+// Group into user/assistant pairs
+function toPairs(messages) {
+  const pairs = [];
+  let cur = { user: "", assistant: "" };
+  let haveContent = false;
 
   for (const m of messages) {
-    const isUser = m.role === "user";
-    const isSystem = m.role === "system";
-    const bg = isSystem ? rgb(1.00, 0.98, 0.78) : isUser ? rgb(0.16, 0.45, 0.90) : rgb(0.88, 0.90, 0.96);
-    const fg = isUser ? rgb(1,1,1) : rgb(0,0,0);
-
-    const lines = wrapText(m.text, font, fontSize, maxBubbleWidth - bubblePad * 2);
-    const bubbleHeight = lines.length * lineHeight + bubblePad * 2;
-    if (y - bubbleHeight < margin) { page = pdfDoc.addPage([pageWidth, pageHeight]); y = pageHeight - margin; }
-
-    const rightSide = isUser;
-    const bubbleX = rightSide ? pageWidth - margin - maxBubbleWidth : margin;
-
-    page.drawRectangle({ x: bubbleX, y: y - bubbleHeight, width: maxBubbleWidth, height: bubbleHeight, color: bg, borderRadius: radius });
-
-    let textY = y - bubblePad - fontSize;
-    for (const rawLine of lines) {
-      const shaped = shapeBidi(rawLine);
-      const logicalWidth = font.widthOfTextAtSize(rawLine, fontSize);
-      const tx = (/\u0590-\u05FF|\u0600-\u06FF/.test(rawLine) || rightSide)
-        ? bubbleX + maxBubbleWidth - bubblePad - logicalWidth
-        : bubbleX + bubblePad;
-      page.drawText(shaped, { x: tx, y: textY, size: fontSize, font, color: fg });
-      textY -= lineHeight;
+    if (m.role === "system") continue;
+    if (m.role === "user") {
+      if (haveContent) { pairs.push(cur); cur = { user: "", assistant: "" }; haveContent = false; }
+      cur.user = (cur.user ? cur.user + "\n\n" : "") + m.text;
+      haveContent = true;
+    } else if (m.role === "assistant") {
+      cur.assistant = (cur.assistant ? cur.assistant + "\n\n" : "") + m.text;
+      haveContent = true;
+      if (cur.user && cur.assistant) { pairs.push(cur); cur = { user: "", assistant: "" }; haveContent = false; }
     }
-
-    y -= bubbleHeight + 10;
   }
-
-  return pdfDoc.save();
+  if (haveContent && (cur.user || cur.assistant)) pairs.push(cur);
+  return pairs;
 }
 
-// ---- Helpers ----
-function wrapText(text, font, fontSize, maxWidth) {
-  const words = String(text).split(/\s+/);
-  let lines = [], line = "";
-  for (const w of words) {
-    const test = line ? line + " " + w : w;
-    if (font.widthOfTextAtSize(test, fontSize) > maxWidth && line) {
-      lines.push(line);
-      line = w;
-    } else {
-      line = test;
-    }
+// ---------- API handler ----------
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", ["POST"]);
+    return error(res, 405, "METHOD_NOT_ALLOWED", "Use POST /api/extract");
   }
-  if (line) lines.push(line);
-  return lines;
+
+  const { url, content, format = "messages" } = req.body || {};
+  if (!url && !content) {
+    return error(res, 400, "INVALID_INPUT", "Provide a single chat URL (url) or raw content (content).");
+  }
+
+  // Raw content path (no scraping)
+  if (content?.trim() && !url) {
+    const messages = parseMessages(content.trim(), "custom-content");
+    const body = { ok: true, host: "custom-content", count: messages.length, messages };
+    if (format === "pairs") body.pairs = toPairs(messages);
+    return res.status(200).json(body);
+  }
+
+  // URL path
+  let input;
+  try { input = new URL(url); } catch { return error(res, 400, "BAD_URL", "Invalid URL."); }
+  if (String(url).length > MAX_URL_LENGTH) {
+    return error(res, 400, "URL_TOO_LONG", "URL exceeds maximum length.");
+  }
+  if (!ALLOWED_HOSTS.some((h) => input.hostname.endsWith(h))) {
+    return error(res, 400, "DOMAIN_NOT_ALLOWED", "This domain is not supported.", { host: input.hostname });
+  }
+  // If g.co, restrict to /gemini/share/*
+  if (input.hostname.endsWith("g.co") && !input.pathname.startsWith("/gemini/share/")) {
+    return error(res, 400, "DOMAIN_NOT_ALLOWED", "Only g.co/gemini/share/* short-links are supported.", {
+      host: input.hostname, path: input.pathname
+    });
+  }
+
+  // Resolve short-links first (so we validate final host and scrape right URL)
+  const resolved = await resolveShareUrl(input.toString());
+  const finalUrl = resolved.url;
+  let u;
+  try { u = new URL(finalUrl); } catch { return error(res, 400, "BAD_URL", "Final URL invalid after redirect."); }
+
+  // After resolution, validate final host (should be gemini.google.com for g.co short-links)
+  if (!ALLOWED_HOSTS.some((h) => u.hostname.endsWith(h))) {
+    return error(res, 400, "DOMAIN_NOT_ALLOWED", "Final URL host not allowed after redirect.", {
+      finalHost: u.hostname, hops: resolved.hops, status: resolved.status || 0, location: resolved.location || ""
+    });
+  }
+
+  // Preflight for public access (on the final URL)
+  const pre = await checkPublicAccess(u.toString());
+  if (!pre.ok) {
+    return error(res, 422, "PRIVATE_SHARE", pre.message, { status: pre.status, location: pre.location });
+  }
+
+  const BROWSERLESS_WS_URL = process.env.BROWSERLESS_WS_URL;
+  if (!BROWSERLESS_WS_URL) {
+    return error(res, 500, "BROWSERLESS_MISSING", "Set BROWSERLESS_WS_URL in env variables.");
+  }
+
+  let browser;
+  try {
+    browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_WS_URL });
+    const raw = await scrapeChat(u.toString(), browser);
+    if (!raw || raw.length < 60) {
+      await safeDisconnect(browser);
+      return error(res, 422, "EXTRACT_EMPTY", "Could not extract enough text.");
+    }
+    if (raw.length > MAX_TEXT_LENGTH) {
+      await safeDisconnect(browser);
+      return error(res, 422, "EXTRACT_TOO_LARGE", "Extracted text is too large.");
+    }
+
+    const messages = parseMessages(raw, u.hostname);
+    await safeDisconnect(browser);
+
+    const body = { ok: true, host: u.hostname, count: messages.length, messages };
+    if (format === "pairs") body.pairs = toPairs(messages);
+    return res.status(200).json(body);
+  } catch (e) {
+    await safeDisconnect(browser);
+    return error(res, 500, "SCRAPE_FAILED", "Failed to extract conversation.", { message: e?.message });
+  }
 }
 
 async function safeDisconnect(browser) {
   try { await browser.disconnect(); } catch {}
-}
-
-async function clickByText(page, labels) {
-  try {
-    await page.evaluate((texts) => {
-      const tryClick = (t) => {
-        const xp = `//button[normalize-space(text())='${t}'] | //*[self::button or self::a or self::div][contains(@role,'button')][normalize-space(text())='${t}']`;
-        const r = document.evaluate(xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-        if (r.snapshotLength > 0) { (r.snapshotItem(0)).click(); return true; }
-        return false;
-      };
-      for (const t of texts) if (tryClick(t)) break;
-    }, labels);
-  } catch {}
 }

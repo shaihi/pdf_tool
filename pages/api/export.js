@@ -27,27 +27,37 @@ function error(res, status, code, message, details = {}) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // NEW: preflight public-access checker (detects login redirects / 4xx/5xx)
+// replace checkPublicAccess with this
 async function checkPublicAccess(u) {
   try {
     const r = await fetch(u, { method: "GET", redirect: "manual" });
     const status = r.status;
     const loc = r.headers.get("location") || "";
-    const urlLower = (loc || "").toLowerCase();
-    const isLoginRedirect =
-      status >= 300 && status < 400 &&
-      (urlLower.includes("login") || urlLower.includes("signin") || urlLower.includes("auth"));
-    const isBlocked = status >= 400;
-    if (isLoginRedirect || isBlocked) {
-      return {
-        ok: false,
-        status,
-        location: loc,
-        reason: "PRIVATE_OR_BLOCKED",
-        message:
-          "This share link isn’t public (redirects to login or returns an error). Open it in an incognito window; if it prompts to sign in, make the share public.",
-      };
-    }
-    return { ok: true, status };
+    const target = new URL(u);
+    const redir = loc ? new URL(loc, target.origin) : null;
+
+    const toLogin =
+      (redir && /login|signin|auth|session/i.test(redir.pathname + redir.search)) ||
+      (redir && /accounts\.google\.com|auth|login/i.test(redir.hostname));
+
+    // OK if:
+    // - 200, OR
+    // - 3xx redirect that stays within claude.ai (or same host) AND not to a login/auth path
+    const sameHost = redir && (redir.hostname === target.hostname);
+    const isPublic =
+      (status >= 200 && status < 300) ||
+      (status >= 300 && status < 400 && sameHost && !toLogin);
+
+    if (isPublic) return { ok: true, status, location: loc || "" };
+
+    return {
+      ok: false,
+      status,
+      location: loc || "",
+      reason: "PRIVATE_OR_BLOCKED",
+      message:
+        "This share link isn’t public (redirects to login or returns an error). Open it in an incognito window; if it prompts to sign in, make the share public.",
+    };
   } catch (e) {
     return { ok: false, status: 0, reason: "NETWORK", message: e?.message || "Network error" };
   }
